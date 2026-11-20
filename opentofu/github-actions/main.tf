@@ -58,7 +58,6 @@ resource "aws_iam_role_policy_attachments_exclusive" "github_actions" {
   policy_arns = [
     "arn:aws:iam::aws:policy/AmazonS3FullAccess",
     "arn:aws:iam::aws:policy/AWSDeviceFarmFullAccess",
-    "arn:aws:iam::373521797162:policy/STS",
     "arn:aws:iam::373521797162:policy/github-actions-s3-buckets",
   ]
 }
