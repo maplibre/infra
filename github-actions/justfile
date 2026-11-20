@@ -1,0 +1,24 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+set positional-arguments
+
+stack := source_directory() / "../opentofu/github-actions"
+
+# List commands for the roles GitHub Actions assumes.
+default:
+    @just --list
+
+# Check the stack without changing infrastructure.
+check:
+    tofu -chdir="{{stack}}" validate
+
+# Connect to the existing github-actions state in S3.
+init:
+    tofu -chdir="{{stack}}" init
+
+# Review changes and save a plan; this does not deploy anything.
+plan:
+    GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token)}" tofu -chdir="{{stack}}" plan -out=deploy.tfplan
+
+# Apply the saved plan.
+apply:
+    GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token)}" tofu -chdir="{{stack}}" apply deploy.tfplan

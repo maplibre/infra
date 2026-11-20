@@ -2,9 +2,9 @@
 
 Each directory is an independent root with its own provider lockfile and S3 state
 key. `bootstrap/` manages the shared state bucket; `ctcache/` and `forgejo/` manage
-servers. Service-specific NixOS configuration, operator scripts and deployment
-notes live in [`../ctcache/`](../ctcache/README.md) and
-[`../forgejo/`](../forgejo/README.md).
+servers; `github-actions/` manages the IAM roles that GitHub Actions assumes.
+Service-specific NixOS configuration, operator scripts and deployment notes live
+in [`../ctcache/`](../ctcache/README.md) and [`../forgejo/`](../forgejo/README.md).
 Add future stacks alongside these roots with a distinct state key. Keep shared
 modules out of the layout until there is actual duplication to extract.
 
@@ -23,6 +23,7 @@ The bucket already exists in `us-east-1`. Initialize each root directly:
 tofu -chdir=opentofu/bootstrap init
 tofu -chdir=opentofu/ctcache init
 tofu -chdir=opentofu/forgejo init
+tofu -chdir=opentofu/github-actions init
 ```
 
 Each root's state key is its directory name, such as `forgejo/terraform.tfstate`.
