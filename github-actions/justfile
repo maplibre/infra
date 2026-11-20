@@ -17,8 +17,8 @@ init:
 
 # Review changes and save a plan; this does not deploy anything.
 plan:
-    tofu -chdir="{{stack}}" plan -out=deploy.tfplan
+    GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token)}" tofu -chdir="{{stack}}" plan -out=deploy.tfplan
 
 # Apply the saved plan.
 apply:
-    tofu -chdir="{{stack}}" apply deploy.tfplan
+    GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token)}" tofu -chdir="{{stack}}" apply deploy.tfplan
