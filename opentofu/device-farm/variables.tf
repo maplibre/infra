@@ -11,7 +11,7 @@ variable "mln_rs_project_arn" {
 }
 
 variable "lambda_package_path" {
-  description = "Path (relative to opentofu/device-farm) to the built Lambda bootstrap.zip package."
+  description = "Path (relative to opentofu/device-farm) to the built Lambda lambda.zip package."
   type        = string
-  default     = "../../device-farm/build/bootstrap.zip"
+  default     = "../../device-farm/build/lambda.zip"
 }

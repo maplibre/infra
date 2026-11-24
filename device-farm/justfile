@@ -7,23 +7,22 @@ stack := source_directory() / "../opentofu/device-farm"
 default:
     @just --list
 
-# Format the Go source files.
-fmt:
-    gofmt -w .
+# Install npm dependencies.
+install:
+    npm ci
 
-# Run gofmt check, go vet, race-enabled tests, and OpenTofu validation without changing infrastructure.
+# Format the TypeScript source files.
+fmt:
+    npm run fmt
+
+# Run formatting, TypeScript typecheck, unit tests, and OpenTofu validation without changing infrastructure.
 check:
-    test -z "$(gofmt -l .)"
-    go vet ./...
-    go test -race ./...
+    npm run check
     tofu -chdir="{{stack}}" validate
 
-# Build the static linux/arm64 Lambda bootstrap binary and zip package.
+# Bundle the TypeScript Lambda into build/lambda.zip (nodejs22.x arm64).
 build:
-    mkdir -p build
-    CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o build/bootstrap ./cmd/device-farm
-    rm -f build/bootstrap.zip
-    zip -j -q build/bootstrap.zip build/bootstrap
+    npm run build
 
 # Create local tfvars from the example.
 configure:

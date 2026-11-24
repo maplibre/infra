@@ -1,14 +1,14 @@
 # AWS Device Farm Orchestrator
 
-A serverless Go Lambda orchestrator in `us-west-2` that bridges GitHub Actions CI
+A serverless TypeScript Lambda orchestrator in `us-west-2` that bridges GitHub Actions CI
 builds to AWS Device Farm hardware runs and reports results back as a GitHub Check
 Run (`device-test / android`). The OpenTofu stack lives in
 [`../opentofu/device-farm/`](../opentofu/README.md).
 
 ## Architecture
 
-One static `linux/arm64` Go binary (`provided.al2023`, handler `bootstrap`) runs in
-three modes selected by the `MODE` environment variable:
+One esbuild-bundled Node.js 22 ESM bundle (`nodejs22.x`, `arm64`, handler `index.handler`)
+runs in three modes selected by the `MODE` environment variable:
 
 1. **`webhook`** (`128 MB`, `10s` timeout, Lambda Function URL): validates
    `X-Hub-Signature-256` against the GitHub App webhook secret from Secrets Manager,
@@ -72,6 +72,7 @@ Create an organization GitHub App (e.g. **MapLibre Device Farm**) under `maplibr
 From the repository root (with AWS credentials targeting account `373521797162`):
 
 ```sh
+just device-farm::install
 just device-farm::init
 just device-farm::build
 just device-farm::configure   # optional: edit opentofu/device-farm/terraform.tfvars
@@ -138,9 +139,9 @@ Then run `just device-farm::plan` and `just device-farm::apply`, and add
 
 ## Adding another repository (e.g. `maplibre/maplibre-native`)
 
-1. Add a `RepoConfig` entry to `defaultRepos` in
-   [`internal/config/config.go`](internal/config/config.go) (and read an optional
-   project ARN env var such as `MAPLIBRE_NATIVE_PROJECT_ARN` in `LoadFromLookup`).
+1. Add a `RepoConfig` entry to `defaultRepos` in [`src/config.ts`](src/config.ts)
+   (and read an optional project ARN env var such as `MAPLIBRE_NATIVE_PROJECT_ARN`
+   in `loadConfig`).
 2. Add the corresponding variable and Lambda environment variable in
    [`../opentofu/device-farm/variables.tf`](../opentofu/device-farm/variables.tf)
    and [`../opentofu/device-farm/main.tf`](../opentofu/device-farm/main.tf).

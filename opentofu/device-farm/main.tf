@@ -298,9 +298,9 @@ resource "aws_iam_role_policy" "webhook" {
 resource "aws_lambda_function" "webhook" {
   function_name    = "${local.name_prefix}-webhook"
   role             = aws_iam_role.webhook.arn
-  runtime          = "provided.al2023"
+  runtime          = "nodejs22.x"
   architectures    = ["arm64"]
-  handler          = "bootstrap"
+  handler          = "index.handler"
   filename         = local.lambda_zip_path
   source_code_hash = local.lambda_source_hash
   memory_size      = 128
@@ -408,9 +408,9 @@ resource "aws_iam_role_policy" "worker" {
 resource "aws_lambda_function" "worker" {
   function_name    = "${local.name_prefix}-worker"
   role             = aws_iam_role.worker.arn
-  runtime          = "provided.al2023"
+  runtime          = "nodejs22.x"
   architectures    = ["arm64"]
-  handler          = "bootstrap"
+  handler          = "index.handler"
   filename         = local.lambda_zip_path
   source_code_hash = local.lambda_source_hash
   memory_size      = 1024
@@ -493,9 +493,9 @@ resource "aws_iam_role_policy" "poller" {
 resource "aws_lambda_function" "poller" {
   function_name    = "${local.name_prefix}-poller"
   role             = aws_iam_role.poller.arn
-  runtime          = "provided.al2023"
+  runtime          = "nodejs22.x"
   architectures    = ["arm64"]
-  handler          = "bootstrap"
+  handler          = "index.handler"
   filename         = local.lambda_zip_path
   source_code_hash = local.lambda_source_hash
   memory_size      = 512

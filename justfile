@@ -36,7 +36,7 @@ bootstrap-migrate:
     mv opentofu/bootstrap/backend.tf.disabled opentofu/bootstrap/backend.tf
     tofu -chdir=opentofu/bootstrap init -migrate-state
 
-# Format the infrastructure, Go, and Nix configurations.
+# Format the infrastructure, TypeScript, and Nix configurations.
 fmt: ctcache::fmt device-farm::fmt forgejo::fmt
     tofu fmt -recursive opentofu
 
