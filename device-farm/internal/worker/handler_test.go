@@ -33,6 +33,7 @@ type fakeGH struct {
 	jobs               []github.WorkflowJob
 	artifacts          []github.Artifact
 	downloadErr        error
+	downloadBytes      []byte
 	onDownload         func()
 	rawFileRef         string
 	rawFileBytes       []byte
@@ -122,6 +123,7 @@ func (f *fakeGH) DownloadArtifact(_ context.Context, _ int64, _, _ string, _ int
 	f.mu.Lock()
 	f.downloadCalls++
 	err := f.downloadErr
+	rawBytes := f.downloadBytes
 	hook := f.onDownload
 	f.mu.Unlock()
 	if hook != nil {
@@ -129,6 +131,9 @@ func (f *fakeGH) DownloadArtifact(_ context.Context, _ int64, _, _ string, _ int
 	}
 	if err != nil {
 		return err
+	}
+	if rawBytes != nil {
+		return os.WriteFile(dstPath, rawBytes, 0o600)
 	}
 	out, err := os.Create(dstPath)
 	if err != nil {
@@ -1440,4 +1445,54 @@ func TestWorkerRejectsSupersededWorkflowAttempt(t *testing.T) {
 			t.Fatalf("expected rerun claim finalized to CLAIMED, got %+v", rec)
 		}
 	})
+}
+
+func TestWorkerInvalidArtifactArchiveCompletesWithoutRetry(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+
+	gh := newFakeGH()
+	gh.workflowRun = github.WorkflowRun{
+		ID:         620,
+		RunAttempt: 1,
+		HeadBranch: "main",
+		HeadSHA:    "bad-zip-sha",
+		CreatedAt:  now,
+	}
+	gh.workflowRun.HeadRepository.FullName = "maplibre/mln-rs"
+	gh.artifacts = []github.Artifact{{ID: 80, Name: "android-device-tests", CreatedAt: now}}
+	gh.downloadBytes = []byte("not-a-valid-zip-archive")
+
+	st := newFakeStore()
+	df := &fakeDF{}
+	h := NewHandler(testWorkerCfg(), gh, st, df, nil)
+	h.now = func() time.Time { return now }
+
+	resp, err := h.Handle(context.Background(), sqsEventOf(t, model.JobMessage{
+		Event:              model.EventWorkflowJob,
+		Action:             "completed",
+		Repo:               "maplibre/mln-rs",
+		InstallationID:     99,
+		HeadSHA:            "bad-zip-sha",
+		HeadBranch:         "main",
+		WorkflowRunID:      620,
+		WorkflowRunAttempt: 1,
+		JobConclusion:      "success",
+	}))
+	if err != nil || len(resp.BatchItemFailures) != 0 {
+		t.Fatalf("Handle() err=%v failures=%v (expected permanent failure without SQS retry)", err, resp.BatchItemFailures)
+	}
+	if len(df.scheduledIn) != 0 {
+		t.Fatalf("expected 0 Device Farm runs scheduled, got %d", len(df.scheduledIn))
+	}
+	updates := gh.updated[101]
+	if len(updates) == 0 {
+		t.Fatalf("expected Check Run 101 to be updated, got updates=%+v", gh.updated)
+	}
+	last := updates[len(updates)-1]
+	if last.Status != "completed" || last.Conclusion != "failure" || last.Output == nil || last.Output.Title != "Invalid artifact" {
+		t.Fatalf("expected completed/failure Invalid artifact check run update, got %+v", last)
+	}
+	if rec := st.records[model.ClaimKey("maplibre/mln-rs", 620, 1)]; rec.State != model.StateClaimed {
+		t.Fatalf("expected claim finalized to CLAIMED, got %+v", rec)
+	}
 }

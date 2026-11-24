@@ -529,10 +529,13 @@ func (h *Handler) scheduleDeviceFarmRun(ctx context.Context, repo config.RepoCon
 	// Extract only the inner package zip without unpacking or executing anything inside it.
 	pkgPath := filepath.Join(tmpDir, repo.PackageFilename)
 	if err := report.ExtractPackageFromArtifactZip(outerZipPath, repo.PackageFilename, pkgPath, maxArtifactZipBytes); err != nil {
-		if errors.Is(err, report.ErrPackageNotFound) {
+		if errors.Is(err, report.ErrPackageNotFound) || errors.Is(err, report.ErrInvalidArchive) {
+			summary := fmt.Sprintf("The CI artifact `%s` did not contain `%s`.", repo.ArtifactName, repo.PackageFilename)
+			if errors.Is(err, report.ErrInvalidArchive) {
+				summary = fmt.Sprintf("The CI artifact `%s` is not a valid ZIP archive or exceeds archive safety limits.", repo.ArtifactName)
+			}
 			_, checkErr := h.completeCheckRun(ctx, repo, msg.InstallationID, headSHA, extID, checkRunID,
-				"failure", "Invalid artifact",
-				fmt.Sprintf("The CI artifact `%s` did not contain `%s`.", repo.ArtifactName, repo.PackageFilename))
+				"failure", "Invalid artifact", summary)
 			if checkErr != nil {
 				releaseClaim()
 				return checkErr
