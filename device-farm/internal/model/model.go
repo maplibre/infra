@@ -70,6 +70,7 @@ type RunRecord struct {
 	WorkflowRunID      int64    `dynamodbav:"workflow_run_id,omitempty"`
 	WorkflowRunAttempt int      `dynamodbav:"workflow_run_attempt,omitempty"`
 	WorkflowCreatedAt  string   `dynamodbav:"workflow_created_at,omitempty"`
+	RerunDeliveryID    string   `dynamodbav:"rerun_delivery_id,omitempty"`
 	InstallationID     int64    `dynamodbav:"installation_id,omitempty"`
 	CompletedAt        string   `dynamodbav:"completed_at,omitempty"`
 	Result             string   `dynamodbav:"result,omitempty"`
@@ -83,6 +84,12 @@ func ClaimKey(repo string, workflowRunID int64, runAttempt int) string {
 		runAttempt = 1
 	}
 	return fmt.Sprintf("claim#%s#%d#%d", strings.ToLower(repo), workflowRunID, runAttempt)
+}
+
+// RerunClaimKey returns the DynamoDB primary key used to deduplicate deliveries
+// of a check_run.rerequested webhook by (repo, deliveryID).
+func RerunClaimKey(repo, deliveryID string) string {
+	return fmt.Sprintf("claim-rerun#%s#%s", strings.ToLower(repo), deliveryID)
 }
 
 // ExternalID formats the GitHub Check Run external_id as "<workflowRunID>:<runAttempt>".

@@ -23,26 +23,28 @@ import (
 )
 
 type fakeGH struct {
-	mu                sync.Mutex
-	nextCheckID       int64
-	created           []github.CreateCheckRunRequest
-	updated           map[int64][]github.UpdateCheckRunRequest
-	listedChecks      []github.CheckRun
-	workflowRun       github.WorkflowRun
-	jobs              []github.WorkflowJob
-	artifacts         []github.Artifact
-	downloadErr       error
-	onDownload        func()
-	rawFileRef        string
-	rawFileBytes      []byte
-	lastWorkflowRunID int64
+	mu                 sync.Mutex
+	nextCheckID        int64
+	created            []github.CreateCheckRunRequest
+	updated            map[int64][]github.UpdateCheckRunRequest
+	updateErrByCheckID map[int64]error
+	listedChecks       []github.CheckRun
+	workflowRun        github.WorkflowRun
+	jobs               []github.WorkflowJob
+	artifacts          []github.Artifact
+	downloadErr        error
+	onDownload         func()
+	rawFileRef         string
+	rawFileBytes       []byte
+	lastWorkflowRunID  int64
 }
 
 func newFakeGH() *fakeGH {
 	return &fakeGH{
-		nextCheckID:  100,
-		updated:      make(map[int64][]github.UpdateCheckRunRequest),
-		rawFileBytes: []byte("version: 0.1\n"),
+		nextCheckID:        100,
+		updated:            make(map[int64][]github.UpdateCheckRunRequest),
+		updateErrByCheckID: make(map[int64]error),
+		rawFileBytes:       []byte("version: 0.1\n"),
 	}
 }
 
@@ -65,6 +67,9 @@ func (f *fakeGH) CreateCheckRun(_ context.Context, _ int64, _, _ string, in gith
 func (f *fakeGH) UpdateCheckRun(_ context.Context, _ int64, _, _ string, id int64, in github.UpdateCheckRunRequest) (github.CheckRun, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.updateErrByCheckID[id]; err != nil {
+		return github.CheckRun{}, err
+	}
 	f.updated[id] = append(f.updated[id], in)
 	for i := range f.listedChecks {
 		if f.listedChecks[i].ID == id {
@@ -135,17 +140,21 @@ func (f *fakeGH) GetRawFile(_ context.Context, _ int64, _, _, _, ref string) ([]
 }
 
 type fakeStore struct {
-	mu             sync.Mutex
-	records        map[string]model.RunRecord
-	putRunErr      error
-	onPutRun       func()
-	releaseCtxErrs []error
-	releaseCalls   int
-	completeCalls  int
+	mu              sync.Mutex
+	records         map[string]model.RunRecord
+	getRunOverrides map[string]model.RunRecord
+	putRunErr       error
+	onPutRun        func()
+	releaseCtxErrs  []error
+	releaseCalls    int
+	completeCalls   int
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{records: make(map[string]model.RunRecord)}
+	return &fakeStore{
+		records:         make(map[string]model.RunRecord),
+		getRunOverrides: make(map[string]model.RunRecord),
+	}
 }
 
 func (s *fakeStore) ClaimWorkflowRun(_ context.Context, claimKey, owner string, now time.Time) error {
@@ -211,6 +220,16 @@ func (s *fakeStore) PutRun(_ context.Context, rec model.RunRecord) error {
 	defer s.mu.Unlock()
 	s.records[rec.RunARN] = rec
 	return nil
+}
+
+func (s *fakeStore) GetRun(_ context.Context, runARN string) (model.RunRecord, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if rec, ok := s.getRunOverrides[runARN]; ok {
+		return rec, true, nil
+	}
+	rec, ok := s.records[runARN]
+	return rec, ok, nil
 }
 
 func (s *fakeStore) QueryActiveByBranchKey(_ context.Context, branchKey string) ([]model.RunRecord, error) {
@@ -1102,6 +1121,255 @@ func TestWorkerSkippedJobAndSafetyNetAndExpiredRerun(t *testing.T) {
 		updates := gh.updated[newID]
 		if len(updates) == 0 || updates[len(updates)-1].Conclusion != "failure" || !strings.Contains(updates[len(updates)-1].Output.Summary, "expired") {
 			t.Fatalf("expected expired artifact failure update, got %+v", updates)
+		}
+	})
+}
+
+func TestWorkerRerunDeliveryDeduplication(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+
+	t.Run("duplicate DeliveryID skipped while distinct DeliveryID schedules fresh rerun", func(t *testing.T) {
+		gh := newFakeGH()
+		gh.workflowRun = github.WorkflowRun{ID: 750, RunAttempt: 1, HeadBranch: "main", HeadSHA: "rerun-sha", CreatedAt: now}
+		gh.workflowRun.HeadRepository.FullName = "maplibre/mln-rs"
+		gh.artifacts = []github.Artifact{{ID: 51, Name: "android-device-tests", CreatedAt: now}}
+
+		st := newFakeStore()
+		df := &fakeDF{}
+		h := NewHandler(testWorkerCfg(), gh, st, df, nil)
+		h.now = func() time.Time { return now }
+
+		msg := model.JobMessage{
+			Event:          model.EventCheckRun,
+			Action:         "rerequested",
+			DeliveryID:     "delivery-1",
+			Repo:           "maplibre/mln-rs",
+			InstallationID: 99,
+			HeadSHA:        "rerun-sha",
+			CheckRunID:     50,
+			ExternalID:     "750:1",
+		}
+
+		// First delivery schedules run-1 and finalizes claim-rerun#maplibre/mln-rs#delivery-1.
+		resp, err := h.Handle(context.Background(), sqsEventOf(t, msg))
+		if err != nil || len(resp.BatchItemFailures) != 0 {
+			t.Fatalf("first rerun failed: err=%v failures=%v", err, resp.BatchItemFailures)
+		}
+		if len(df.scheduledIn) != 1 {
+			t.Fatalf("scheduledIn = %d, want 1", len(df.scheduledIn))
+		}
+		claimKey := model.RerunClaimKey("maplibre/mln-rs", "delivery-1")
+		if rec := st.records[claimKey]; rec.State != model.StateClaimed || rec.LeaseExpiresAt != 0 {
+			t.Fatalf("expected finalized CLAIMED rerun claim, got %+v", rec)
+		}
+		run1 := st.records["arn:aws:devicefarm:us-west-2:373521797162:run:proj/run-1"]
+		if run1.RerunDeliveryID != "delivery-1" {
+			t.Fatalf("run1.RerunDeliveryID = %q, want delivery-1", run1.RerunDeliveryID)
+		}
+
+		// Duplicate SQS delivery with same DeliveryID is skipped cleanly (no second run, no self-supersede).
+		resp, err = h.Handle(context.Background(), sqsEventOf(t, msg))
+		if err != nil || len(resp.BatchItemFailures) != 0 {
+			t.Fatalf("duplicate rerun failed: err=%v failures=%v", err, resp.BatchItemFailures)
+		}
+		if len(df.scheduledIn) != 1 || len(df.stoppedARNs) != 0 {
+			t.Fatalf("expected duplicate delivery skipped, got scheduled=%d stopped=%v", len(df.scheduledIn), df.stoppedARNs)
+		}
+
+		// Distinct DeliveryID is allowed to rerun again (superseding run-1 and scheduling run-2).
+		msg.DeliveryID = "delivery-2"
+		resp, err = h.Handle(context.Background(), sqsEventOf(t, msg))
+		if err != nil || len(resp.BatchItemFailures) != 0 {
+			t.Fatalf("second distinct rerun failed: err=%v failures=%v", err, resp.BatchItemFailures)
+		}
+		if len(df.scheduledIn) != 2 {
+			t.Fatalf("scheduledIn = %d, want 2 for distinct DeliveryID", len(df.scheduledIn))
+		}
+		if st.records["arn:aws:devicefarm:us-west-2:373521797162:run:proj/run-2"].RerunDeliveryID != "delivery-2" {
+			t.Fatalf("expected run-2 RerunDeliveryID=delivery-2, got %+v", st.records["arn:aws:devicefarm:us-west-2:373521797162:run:proj/run-2"])
+		}
+	})
+
+	t.Run("crash after PutRun deduplicates rerun on expired lease takeover", func(t *testing.T) {
+		gh := newFakeGH()
+		gh.workflowRun = github.WorkflowRun{ID: 751, RunAttempt: 1, HeadBranch: "main", HeadSHA: "rerun-crash-sha", CreatedAt: now}
+		gh.workflowRun.HeadRepository.FullName = "maplibre/mln-rs"
+		gh.artifacts = []github.Artifact{{ID: 52, Name: "android-device-tests", CreatedAt: now}}
+
+		st := newFakeStore()
+		claimKey := model.RerunClaimKey("maplibre/mln-rs", "delivery-crash")
+		st.records[claimKey] = model.RunRecord{
+			RunARN:         claimKey,
+			State:          model.StateClaiming,
+			ClaimOwner:     "crashed-rerun-worker",
+			LeaseExpiresAt: now.Add(-5 * time.Second).Unix(),
+		}
+		existingARN := "arn:aws:devicefarm:us-west-2:373521797162:run:proj/rerun-persisted"
+		st.records[existingARN] = model.RunRecord{
+			RunARN:             existingARN,
+			State:              model.StateActive,
+			RepoSHA:            model.RepoSHAKey("maplibre/mln-rs", "rerun-crash-sha"),
+			Repo:               "maplibre/mln-rs",
+			SHA:                "rerun-crash-sha",
+			WorkflowRunID:      751,
+			WorkflowRunAttempt: 1,
+			RerunDeliveryID:    "delivery-crash",
+		}
+
+		df := &fakeDF{}
+		h := NewHandler(testWorkerCfg(), gh, st, df, nil)
+		h.now = func() time.Time { return now }
+
+		resp, err := h.Handle(context.Background(), sqsEventOf(t, model.JobMessage{
+			Event:          model.EventCheckRun,
+			Action:         "rerequested",
+			DeliveryID:     "delivery-crash",
+			Repo:           "maplibre/mln-rs",
+			InstallationID: 99,
+			HeadSHA:        "rerun-crash-sha",
+			CheckRunID:     50,
+			ExternalID:     "751:1",
+		}))
+		if err != nil || len(resp.BatchItemFailures) != 0 {
+			t.Fatalf("Handle() err=%v failures=%v", err, resp.BatchItemFailures)
+		}
+		if len(df.scheduledIn) != 0 {
+			t.Fatalf("expected 0 new runs when rerun already persisted before crash, got %d", len(df.scheduledIn))
+		}
+		if st.records[claimKey].State != model.StateClaimed {
+			t.Fatalf("expected rerun claim finalized to CLAIMED on takeover dedup, got %s", st.records[claimKey].State)
+		}
+	})
+}
+
+func TestWorkerSupersedeActiveRunsOrderingAndRetry(t *testing.T) {
+	t1 := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+	t2 := t1.Add(5 * time.Minute)
+
+	t.Run("UpdateCheckRun failure keeps superseded run ACTIVE and retries cleanly", func(t *testing.T) {
+		gh := newFakeGH()
+		gh.workflowRun = github.WorkflowRun{ID: 510, RunAttempt: 1, HeadBranch: "feature", HeadSHA: "new-sha", CreatedAt: t2}
+		gh.workflowRun.HeadRepository.FullName = "fork/mln-rs"
+		gh.artifacts = []github.Artifact{{ID: 61, Name: "android-device-tests", CreatedAt: t2}}
+		gh.updateErrByCheckID[42] = errors.New("github 502")
+
+		st := newFakeStore()
+		oldARN := "arn:aws:devicefarm:us-west-2:373521797162:run:proj/old-run"
+		st.records[oldARN] = model.RunRecord{
+			RunARN:            oldARN,
+			State:             model.StateActive,
+			BranchKey:         model.BranchKey("maplibre/mln-rs", "fork/mln-rs", "feature"),
+			RepoSHA:           model.RepoSHAKey("maplibre/mln-rs", "old-sha"),
+			Repo:              "maplibre/mln-rs",
+			SHA:               "old-sha",
+			WorkflowRunID:     509,
+			WorkflowCreatedAt: t1.Format(time.RFC3339),
+			CheckRunID:        42,
+			InstallationID:    99,
+		}
+		df := &fakeDF{}
+		h := NewHandler(testWorkerCfg(), gh, st, df, nil)
+
+		msg := model.JobMessage{
+			Event:              model.EventWorkflowJob,
+			Action:             "completed",
+			Repo:               "maplibre/mln-rs",
+			InstallationID:     99,
+			HeadSHA:            "new-sha",
+			HeadBranch:         "feature",
+			WorkflowRunID:      510,
+			WorkflowRunAttempt: 1,
+			JobConclusion:      "success",
+		}
+
+		// First attempt: UpdateCheckRun on check 42 fails -> returns batch failure, old run stays ACTIVE, claim released.
+		resp, err := h.Handle(context.Background(), sqsEventOf(t, msg))
+		if err != nil || len(resp.BatchItemFailures) != 1 {
+			t.Fatalf("expected 1 batch failure when cancelling superseded check run fails, got err=%v failures=%v", err, resp.BatchItemFailures)
+		}
+		if st.records[oldARN].State != model.StateActive {
+			t.Fatalf("old run state = %s, want ACTIVE so retry/poller can settle check run", st.records[oldARN].State)
+		}
+		if len(df.stoppedARNs) != 1 || df.stoppedARNs[0] != oldARN {
+			t.Fatalf("expected StopRun called before UpdateCheckRun, got %v", df.stoppedARNs)
+		}
+		if len(df.scheduledIn) != 0 {
+			t.Fatalf("expected 0 schedules before retry, got %d", len(df.scheduledIn))
+		}
+		if _, stillClaimed := st.records[model.ClaimKey("maplibre/mln-rs", 510, 1)]; stillClaimed {
+			t.Fatal("expected claim to be released after supersede UpdateCheckRun failure")
+		}
+
+		// Retry after GitHub recovers: old check run cancelled, old record marked SUPERSEDED, new run scheduled.
+		delete(gh.updateErrByCheckID, 42)
+		resp, err = h.Handle(context.Background(), sqsEventOf(t, msg))
+		if err != nil || len(resp.BatchItemFailures) != 0 {
+			t.Fatalf("retry failed: err=%v failures=%v", err, resp.BatchItemFailures)
+		}
+		if st.records[oldARN].State != model.StateSuperseded {
+			t.Fatalf("old run state after retry = %s, want SUPERSEDED", st.records[oldARN].State)
+		}
+		if updates := gh.updated[42]; len(updates) != 1 || updates[0].Conclusion != "cancelled" {
+			t.Fatalf("expected old check run 42 cancelled on retry, got %+v", updates)
+		}
+		if len(df.scheduledIn) != 1 {
+			t.Fatalf("expected 1 run scheduled on retry, got %d", len(df.scheduledIn))
+		}
+	})
+
+	t.Run("skips run that GetRun shows already COMPLETED", func(t *testing.T) {
+		gh := newFakeGH()
+		gh.workflowRun = github.WorkflowRun{ID: 511, RunAttempt: 1, HeadBranch: "feature", HeadSHA: "new-sha-2", CreatedAt: t2}
+		gh.workflowRun.HeadRepository.FullName = "fork/mln-rs"
+		gh.artifacts = []github.Artifact{{ID: 62, Name: "android-device-tests", CreatedAt: t2}}
+
+		st := newFakeStore()
+		finishedARN := "arn:aws:devicefarm:us-west-2:373521797162:run:proj/just-finished"
+		baseRec := model.RunRecord{
+			RunARN:            finishedARN,
+			State:             model.StateActive, // stale GSI view
+			BranchKey:         model.BranchKey("maplibre/mln-rs", "fork/mln-rs", "feature"),
+			RepoSHA:           model.RepoSHAKey("maplibre/mln-rs", "old-sha-2"),
+			Repo:              "maplibre/mln-rs",
+			SHA:               "old-sha-2",
+			WorkflowRunID:     508,
+			WorkflowCreatedAt: t1.Format(time.RFC3339),
+			CheckRunID:        43,
+			InstallationID:    99,
+		}
+		st.records[finishedARN] = baseRec
+		completedRec := baseRec
+		completedRec.State = model.StateCompleted
+		st.getRunOverrides[finishedARN] = completedRec
+
+		df := &fakeDF{}
+		h := NewHandler(testWorkerCfg(), gh, st, df, nil)
+
+		resp, err := h.Handle(context.Background(), sqsEventOf(t, model.JobMessage{
+			Event:              model.EventWorkflowJob,
+			Action:             "completed",
+			Repo:               "maplibre/mln-rs",
+			InstallationID:     99,
+			HeadSHA:            "new-sha-2",
+			HeadBranch:         "feature",
+			WorkflowRunID:      511,
+			WorkflowRunAttempt: 1,
+			JobConclusion:      "success",
+		}))
+		if err != nil || len(resp.BatchItemFailures) != 0 {
+			t.Fatalf("Handle() err=%v failures=%v", err, resp.BatchItemFailures)
+		}
+		if len(df.stoppedARNs) != 0 {
+			t.Fatalf("expected 0 StopRun calls for already COMPLETED run, got %v", df.stoppedARNs)
+		}
+		if len(gh.updated[43]) != 0 {
+			t.Fatalf("expected completed check run 43 untouched, got %+v", gh.updated[43])
+		}
+		if st.records[finishedARN].State == model.StateSuperseded {
+			t.Fatal("already COMPLETED run must not be marked SUPERSEDED")
+		}
+		if len(df.scheduledIn) != 1 {
+			t.Fatalf("expected 1 new run scheduled, got %d", len(df.scheduledIn))
 		}
 	})
 }

@@ -48,6 +48,7 @@ type StoreAPI interface {
 	CompleteWorkflowClaim(ctx context.Context, claimKey, owner string, now time.Time) error
 	ReleaseWorkflowClaim(ctx context.Context, claimKey, owner string) error
 	PutRun(ctx context.Context, rec model.RunRecord) error
+	GetRun(ctx context.Context, runARN string) (model.RunRecord, bool, error)
 	QueryActiveByBranchKey(ctx context.Context, branchKey string) ([]model.RunRecord, error)
 	QueryByRepoSHA(ctx context.Context, repo, sha string) ([]model.RunRecord, error)
 	MarkSuperseded(ctx context.Context, runARN string, completedAt time.Time) error
@@ -321,18 +322,23 @@ func (h *Handler) scheduleDeviceFarmRun(ctx context.Context, repo config.RepoCon
 
 	// Acquire a recoverable ownership-scoped CLAIMING lease before creating checks,
 	// superseding runs, or uploading packages.
-	claimKey := model.ClaimKey(repo.FullName, msg.WorkflowRunID, runAttempt)
+	var claimKey string
+	if !isRerun {
+		claimKey = model.ClaimKey(repo.FullName, msg.WorkflowRunID, runAttempt)
+	} else if msg.DeliveryID != "" {
+		claimKey = model.RerunClaimKey(repo.FullName, msg.DeliveryID)
+	}
 	var claimOwner string
 	claimed := false
-	if !isRerun {
+	if claimKey != "" {
 		claimOwner, err = newClaimOwner()
 		if err != nil {
 			return fmt.Errorf("generate claim owner: %w", err)
 		}
 		if err := h.store.ClaimWorkflowRun(ctx, claimKey, claimOwner, h.now().UTC()); err != nil {
 			if errors.Is(err, store.ErrAlreadyClaimed) {
-				h.logger.Info("skipping duplicate schedule; workflow attempt already claimed",
-					"repo", repo.FullName, "workflow_run_id", msg.WorkflowRunID, "run_attempt", runAttempt)
+				h.logger.Info("skipping duplicate schedule; delivery already claimed",
+					"repo", repo.FullName, "workflow_run_id", msg.WorkflowRunID, "run_attempt", runAttempt, "is_rerun", isRerun, "delivery_id", msg.DeliveryID)
 				return nil
 			}
 			return err
@@ -366,8 +372,13 @@ func (h *Handler) scheduleDeviceFarmRun(ctx context.Context, repo config.RepoCon
 
 	// Guard the rare crash window where a prior invocation persisted PutRun but
 	// crashed before CompleteWorkflowClaim and its lease expired.
-	if !isRerun {
-		alreadyExists, err := h.hasRunForAttempt(ctx, repo.FullName, headSHA, msg.WorkflowRunID, runAttempt)
+	if claimKey != "" {
+		var alreadyExists bool
+		if !isRerun {
+			alreadyExists, err = h.hasRunForAttempt(ctx, repo.FullName, headSHA, msg.WorkflowRunID, runAttempt)
+		} else {
+			alreadyExists, err = h.hasRunForDelivery(ctx, repo.FullName, headSHA, msg.DeliveryID)
+		}
 		if err != nil {
 			releaseClaim()
 			return err
@@ -375,7 +386,7 @@ func (h *Handler) scheduleDeviceFarmRun(ctx context.Context, repo config.RepoCon
 		if alreadyExists {
 			completeClaim()
 			h.logger.Info("skipping duplicate schedule after lease takeover; run already persisted",
-				"repo", repo.FullName, "workflow_run_id", msg.WorkflowRunID, "run_attempt", runAttempt)
+				"repo", repo.FullName, "workflow_run_id", msg.WorkflowRunID, "run_attempt", runAttempt, "is_rerun", isRerun, "delivery_id", msg.DeliveryID)
 			return nil
 		}
 	}
@@ -569,6 +580,10 @@ func (h *Handler) scheduleDeviceFarmRun(ctx context.Context, repo config.RepoCon
 	if !workflowCreatedAt.IsZero() {
 		wfCreatedStr = workflowCreatedAt.Format(time.RFC3339)
 	}
+	var rerunDeliveryID string
+	if isRerun {
+		rerunDeliveryID = msg.DeliveryID
+	}
 	rec := model.RunRecord{
 		RunARN:             runARN,
 		State:              model.StateActive,
@@ -583,6 +598,7 @@ func (h *Handler) scheduleDeviceFarmRun(ctx context.Context, repo config.RepoCon
 		WorkflowRunID:      msg.WorkflowRunID,
 		WorkflowRunAttempt: runAttempt,
 		WorkflowCreatedAt:  wfCreatedStr,
+		RerunDeliveryID:    rerunDeliveryID,
 		InstallationID:     msg.InstallationID,
 		ExpiresAt:          now.Add(store.RecordTTL).Unix(),
 	}
@@ -626,11 +642,12 @@ func (h *Handler) supersedeActiveRuns(ctx context.Context, repo config.RepoConfi
 		if !isRerun && isNewerWorkflowRun(earlier, incomingCreatedAt, incomingRunID) {
 			continue
 		}
-		if err := h.store.MarkSuperseded(ctx, earlier.RunARN, now); err != nil {
-			if errors.Is(err, store.ErrStateConflict) {
-				continue
-			}
+		current, ok, err := h.store.GetRun(ctx, earlier.RunARN)
+		if err != nil {
 			return err
+		}
+		if !ok || current.State != model.StateActive {
+			continue
 		}
 		if err := h.df.StopRun(ctx, earlier.RunARN); err != nil {
 			h.logger.Warn("failed to stop superseded Device Farm run", "run_arn", earlier.RunARN, "err", err)
@@ -651,8 +668,14 @@ func (h *Handler) supersedeActiveRuns(ctx context.Context, repo config.RepoConfi
 				},
 			})
 			if err != nil {
-				h.logger.Warn("failed to mark superseded check run cancelled", "check_run_id", earlier.CheckRunID, "err", err)
+				return fmt.Errorf("mark superseded check run %d cancelled: %w", earlier.CheckRunID, err)
 			}
+		}
+		if err := h.store.MarkSuperseded(ctx, earlier.RunARN, now); err != nil {
+			if errors.Is(err, store.ErrStateConflict) {
+				continue
+			}
+			return err
 		}
 	}
 	return nil
@@ -717,6 +740,25 @@ func (h *Handler) hasRunForAttempt(ctx context.Context, repoFullName, sha string
 			continue
 		}
 		if r.WorkflowRunID == workflowRunID && normalizeAttempt(r.WorkflowRunAttempt) == wantAttempt {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (h *Handler) hasRunForDelivery(ctx context.Context, repoFullName, sha, deliveryID string) (bool, error) {
+	if deliveryID == "" || sha == "" {
+		return false, nil
+	}
+	records, err := h.store.QueryByRepoSHA(ctx, repoFullName, sha)
+	if err != nil {
+		return false, err
+	}
+	for _, r := range records {
+		if !model.IsDeviceFarmARN(r.RunARN) {
+			continue
+		}
+		if r.RerunDeliveryID == deliveryID {
 			return true, nil
 		}
 	}
