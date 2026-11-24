@@ -18,9 +18,11 @@ import {
   branchAllowed,
   branchKey,
   type Config,
+  fetchRepoConfig,
   formatExternalId,
+  InvalidRepoConfigError,
   type JobMessage,
-  lookupRepo,
+  lookupProjectArn,
   parseExternalId,
   repoShaKey,
 } from "./config.js";
@@ -119,9 +121,20 @@ async function processJob(
   store: RunStore,
   df: DeviceFarmClient,
 ): Promise<void> {
-  const repo = lookupRepo(cfg, msg.repo);
-  if (!repo) return;
+  const projectArn = lookupProjectArn(cfg, msg.repo);
+  if (!projectArn) return;
   const gh = await getOctokit(msg.installationId);
+  let repo;
+  try {
+    repo = await fetchRepoConfig(gh, msg.repo, msg.defaultBranch || "main", projectArn);
+  } catch (err) {
+    if (err instanceof InvalidRepoConfigError) {
+      console.error("invalid repo config", msg.repo, err.message);
+      return;
+    }
+    throw err;
+  }
+  if (!repo) return;
   const base = { owner: repo.owner, repo: repo.name };
 
   const settle = async (

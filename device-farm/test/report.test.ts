@@ -5,7 +5,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import yazl from "yazl";
-import { loadConfig, parseExternalId } from "../src/config.js";
+import {
+  InvalidRepoConfigError,
+  loadConfig,
+  parseExternalId,
+  parseRepoConfig,
+} from "../src/config.js";
 import {
   buildCheckOutput,
   consoleUrl,
@@ -35,16 +40,55 @@ async function makeZip(path: string, files: Record<string, Buffer | string>): Pr
 }
 
 describe("config & helpers", () => {
-  it("loads mode-specific config and parses external IDs", () => {
+  it("loads mode-specific config, parses external IDs, and validates .config/device-farm.toml", () => {
+    const projectArn = "arn:aws:devicefarm:us-west-2:373521797162:project:proj-1";
     const cfg = loadConfig({
       MODE: "webhook",
       GITHUB_APP_SECRET_ARN: "arn:aws:secretsmanager:us-west-2:123:secret:gh",
       JOBS_QUEUE_URL: "https://sqs.us-west-2.amazonaws.com/123/jobs",
+      REPO_PROJECTS: JSON.stringify({ "maplibre/mln-rs": projectArn }),
       ALLOWED_BRANCHES: "ci/test, main",
     });
     assert.equal(cfg.mode, "webhook");
     assert.deepEqual([...cfg.allowedBranches], ["ci/test", "main"]);
+    assert.equal(cfg.repoProjects.get("maplibre/mln-rs"), projectArn);
     assert.throws(() => loadConfig({ MODE: "worker" }));
+
+    const repo = parseRepoConfig(
+      `
+      workflow_name = "ci"
+      trigger_job = "prepare-device-tests"
+      artifact_name = "android-device-tests"
+      package_filename = "android-tests.zip"
+      test_spec_path = "tools/device-farm/android.yml"
+      check_name = "device-test / android"
+      job_timeout_minutes = 45
+      devices = [
+        "arn:aws:devicefarm:us-west-2::device:6D89F408709B4D3BBBBB17696A24B141",
+      ]
+      `,
+      { fullName: "maplibre/mln-rs", defaultBranch: "main", projectArn },
+    );
+    assert.equal(repo.triggerJob, "prepare-device-tests");
+    assert.equal(repo.jobTimeoutMinutes, 45);
+    assert.equal(repo.devices.length, 1);
+
+    assert.throws(
+      () =>
+        parseRepoConfig(
+          `workflow_name = "ci"\ntrigger_job = "a"\nartifact_name = "b"\npackage_filename = "../evil.zip"\ntest_spec_path = "c"\ncheck_name = "d"\ndevices = ["arn:aws:devicefarm:us-west-2::device:1"]`,
+          { fullName: "maplibre/mln-rs", defaultBranch: "main", projectArn },
+        ),
+      InvalidRepoConfigError,
+    );
+    assert.throws(
+      () =>
+        parseRepoConfig(
+          `workflow_name = "ci"\ntrigger_job = "a"\nartifact_name = "b"\npackage_filename = "p.zip"\ntest_spec_path = "c"\ncheck_name = "d"\njob_timeout_minutes = 999\ndevices = ["arn:aws:devicefarm:us-west-2::device:1"]`,
+          { fullName: "maplibre/mln-rs", defaultBranch: "main", projectArn },
+        ),
+      InvalidRepoConfigError,
+    );
 
     assert.deepEqual(parseExternalId("123"), { runId: 123, attempt: 1 });
     assert.deepEqual(parseExternalId("123:2"), { runId: 123, attempt: 2 });

@@ -1,6 +1,21 @@
 import { verify } from "@octokit/webhooks-methods";
 import type { APIGatewayProxyEventV2, APIGatewayProxyStructuredResultV2 } from "aws-lambda";
-import { branchAllowed, type Config, type JobMessage, lookupRepo } from "./config.js";
+import {
+  branchAllowed,
+  type Config,
+  InvalidRepoConfigError,
+  type JobMessage,
+  lookupProjectArn,
+  REPO_CONFIG_PATH,
+  type RepoConfig,
+} from "./config.js";
+
+export type RepoConfigLoader = (
+  fullName: string,
+  defaultBranch: string,
+  projectArn: string,
+  installationId: number,
+) => Promise<RepoConfig | null>;
 
 const json = (
   statusCode: number,
@@ -23,6 +38,7 @@ export async function handleWebhook(
   event: APIGatewayProxyEventV2,
   cfg: Config,
   getWebhookSecret: () => Promise<string>,
+  loadRepoConfig: RepoConfigLoader,
   enqueue: (msg: JobMessage) => Promise<void>,
 ): Promise<APIGatewayProxyStructuredResultV2> {
   if (event.requestContext?.http?.method && event.requestContext.http.method !== "POST") {
@@ -48,14 +64,35 @@ export async function handleWebhook(
     return json(400, { error: "invalid json" });
   }
 
-  const repo = lookupRepo(cfg, payload.repository?.full_name ?? "");
-  if (!repo) return json(200, { status: "ignored", reason: "unconfigured repository" });
+  const fullName: string = payload.repository?.full_name ?? "";
+  const projectArn = lookupProjectArn(cfg, fullName);
+  if (!projectArn) return json(200, { status: "ignored", reason: "unconfigured repository" });
 
   const installationId: number = payload.installation?.id ?? 0;
   if (!installationId) return json(400, { error: "missing installation.id" });
 
+  const action: string = payload.action ?? "";
+  const relevant =
+    (eventType === "workflow_job" && action === "completed") ||
+    (eventType === "workflow_run" && action === "completed") ||
+    (eventType === "check_run" && action === "rerequested");
+  if (!relevant) return json(200, { status: "ignored" });
+
+  const defaultBranch: string = payload.repository?.default_branch || "main";
+  let repo: RepoConfig | null;
+  try {
+    repo = await loadRepoConfig(fullName, defaultBranch, projectArn, installationId);
+  } catch (err) {
+    if (err instanceof InvalidRepoConfigError) {
+      console.error("invalid repo config", fullName, err.message);
+      return json(422, { error: err.message });
+    }
+    throw err;
+  }
+  if (!repo) return json(200, { status: "ignored", reason: `missing ${REPO_CONFIG_PATH}` });
+
   let msg: JobMessage | null = null;
-  if (eventType === "workflow_job" && payload.action === "completed") {
+  if (eventType === "workflow_job") {
     const job = payload.workflow_job;
     if (
       job?.name === repo.triggerJob &&
@@ -67,6 +104,7 @@ export async function handleWebhook(
         event: "workflow_job",
         action: "completed",
         repo: repo.fullName,
+        defaultBranch: repo.defaultBranch,
         installationId,
         headSha: job.head_sha,
         headBranch: job.head_branch || undefined,
@@ -75,13 +113,14 @@ export async function handleWebhook(
         jobConclusion: job.conclusion || "",
       };
     }
-  } else if (eventType === "workflow_run" && payload.action === "completed") {
+  } else if (eventType === "workflow_run") {
     const run = payload.workflow_run;
     if (run?.name === repo.workflowName && run.id && run.head_sha) {
       msg = {
         event: "workflow_run",
         action: "completed",
         repo: repo.fullName,
+        defaultBranch: repo.defaultBranch,
         installationId,
         headSha: run.head_sha,
         headBranch: run.head_branch || undefined,
@@ -90,13 +129,14 @@ export async function handleWebhook(
         workflowRunAttempt: run.run_attempt || 1,
       };
     }
-  } else if (eventType === "check_run" && payload.action === "rerequested") {
+  } else if (eventType === "check_run") {
     const cr = payload.check_run;
     if (cr?.name === repo.checkName && cr.id && cr.head_sha) {
       msg = {
         event: "check_run",
         action: "rerequested",
         repo: repo.fullName,
+        defaultBranch: repo.defaultBranch,
         installationId,
         headSha: cr.head_sha,
         headBranch: cr.check_suite?.head_branch || undefined,

@@ -1,15 +1,21 @@
 import { GetSecretValueCommand, SecretsManagerClient } from "@aws-sdk/client-secrets-manager";
 import { App, type Octokit } from "octokit";
+import { parse as parseToml } from "smol-toml";
 
 export type Mode = "webhook" | "worker" | "poller";
 
 export const DEFAULT_REGION = "us-west-2";
-export const DEFAULT_MLN_RS_PROJECT_ARN =
-  "arn:aws:devicefarm:us-west-2:373521797162:project:c5c3f5f6-e21b-41c4-a235-489d30075aeb";
-export const DEVICE_GOOGLE_PIXEL_9 =
-  "arn:aws:devicefarm:us-west-2::device:6D89F408709B4D3BBBBB17696A24B141";
-export const DEVICE_SAMSUNG_GALAXY_S25 =
-  "arn:aws:devicefarm:us-west-2::device:092D78E7B4694568812D5FF0711CD346";
+export const REPO_CONFIG_PATH = ".config/device-farm.toml";
+export const DEFAULT_JOB_TIMEOUT_MINUTES = 60;
+export const MAX_JOB_TIMEOUT_MINUTES = 90;
+export const MAX_DEVICES = 10;
+
+export class InvalidRepoConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidRepoConfigError";
+  }
+}
 
 export interface RepoConfig {
   fullName: string;
@@ -36,13 +42,14 @@ export interface Config {
   resultsBucketName: string;
   resultsBaseUrl: string;
   allowedBranches: Set<string>;
-  repos: Map<string, RepoConfig>;
+  repoProjects: Map<string, string>;
 }
 
 export interface JobMessage {
   event: "workflow_job" | "workflow_run" | "check_run";
   action: string;
   repo: string;
+  defaultBranch: string;
   installationId: number;
   headSha: string;
   headBranch?: string;
@@ -73,6 +80,22 @@ export interface RunRecord {
   expires_at: number;
 }
 
+function parseRepoProjects(raw: string): Map<string, string> {
+  if (!raw) return new Map();
+  const parsed = JSON.parse(raw) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("REPO_PROJECTS must be a JSON object mapping owner/repo to project ARN");
+  }
+  const map = new Map<string, string>();
+  for (const [repo, arn] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof arn !== "string" || !arn.trim()) {
+      throw new Error(`REPO_PROJECTS["${repo}"] must be a non-empty project ARN`);
+    }
+    map.set(repo.trim().toLowerCase(), arn.trim());
+  }
+  return map;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const get = (k: string) => (env[k] ?? "").trim();
   const mode = get("MODE") as Mode;
@@ -81,22 +104,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   const githubAppSecretArn = get("GITHUB_APP_SECRET_ARN");
   if (!githubAppSecretArn) throw new Error("GITHUB_APP_SECRET_ARN is required");
-
-  const mlnRs: RepoConfig = {
-    fullName: "maplibre/mln-rs",
-    owner: "maplibre",
-    name: "mln-rs",
-    defaultBranch: "main",
-    projectArn: get("MLN_RS_PROJECT_ARN") || DEFAULT_MLN_RS_PROJECT_ARN,
-    workflowName: "ci",
-    triggerJob: "prepare-device-tests",
-    artifactName: "android-device-tests",
-    packageFilename: "android-tests.zip",
-    testSpecPath: "tools/device-farm/android.yml",
-    checkName: "device-test / android",
-    jobTimeoutMinutes: 60,
-    devices: [DEVICE_GOOGLE_PIXEL_9, DEVICE_SAMSUNG_GALAXY_S25],
-  };
 
   const cfg: Config = {
     mode,
@@ -112,10 +119,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
         .map((s) => s.trim())
         .filter(Boolean),
     ),
-    repos: new Map([[mlnRs.fullName, mlnRs]]),
+    repoProjects: parseRepoProjects(get("REPO_PROJECTS")),
   };
 
   if (mode === "webhook" && !cfg.jobsQueueUrl) throw new Error("JOBS_QUEUE_URL is required");
+  if ((mode === "webhook" || mode === "worker") && cfg.repoProjects.size === 0) {
+    throw new Error("REPO_PROJECTS must configure at least one repository");
+  }
   if ((mode === "worker" || mode === "poller") && !cfg.runsTableName) {
     throw new Error("RUNS_TABLE_NAME is required");
   }
@@ -125,8 +135,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   return cfg;
 }
 
-export const lookupRepo = (cfg: Config, fullName: string) =>
-  cfg.repos.get(fullName.trim().toLowerCase());
+export const lookupProjectArn = (cfg: Config, fullName: string) =>
+  cfg.repoProjects.get(fullName.trim().toLowerCase());
 export const branchAllowed = (cfg: Config, branch?: string) =>
   cfg.allowedBranches.size === 0 || (Boolean(branch) && cfg.allowedBranches.has(branch!));
 export const branchKey = (repo: string, headRepo: string, headBranch: string) =>
@@ -134,6 +144,11 @@ export const branchKey = (repo: string, headRepo: string, headBranch: string) =>
 export const repoShaKey = (repo: string, sha: string) => `${repo.toLowerCase()}#${sha}`;
 export const formatExternalId = (runId: number, attempt: number) =>
   `${runId}:${Math.max(1, attempt)}`;
+
+export function splitRepo(fullName: string): { owner: string; name: string } | null {
+  const parts = fullName.trim().split("/");
+  return parts.length === 2 && parts[0] && parts[1] ? { owner: parts[0], name: parts[1] } : null;
+}
 
 export function parseExternalId(raw?: string): { runId: number; attempt: number } | null {
   if (!raw) return null;
@@ -144,6 +159,137 @@ export function parseExternalId(raw?: string): { runId: number; attempt: number 
   return Number.isSafeInteger(runId) && runId > 0 && Number.isSafeInteger(attempt) && attempt > 0
     ? { runId, attempt }
     : null;
+}
+
+export function parseRepoConfig(
+  rawToml: string,
+  meta: { fullName: string; defaultBranch: string; projectArn: string },
+): RepoConfig {
+  const parts = splitRepo(meta.fullName);
+  if (!parts) throw new InvalidRepoConfigError(`Invalid repository name "${meta.fullName}"`);
+
+  let doc: Record<string, unknown>;
+  try {
+    doc = parseToml(rawToml) as Record<string, unknown>;
+  } catch (err) {
+    throw new InvalidRepoConfigError(
+      `Failed to parse ${REPO_CONFIG_PATH}: ${(err as Error).message}`,
+    );
+  }
+
+  const reqStr = (key: string) => {
+    const v = doc[key];
+    if (typeof v !== "string" || !v.trim()) {
+      throw new InvalidRepoConfigError(`${REPO_CONFIG_PATH}: "${key}" must be a non-empty string`);
+    }
+    return v.trim();
+  };
+
+  const timeout =
+    doc.job_timeout_minutes === undefined ? DEFAULT_JOB_TIMEOUT_MINUTES : doc.job_timeout_minutes;
+  if (
+    typeof timeout !== "number" ||
+    !Number.isInteger(timeout) ||
+    timeout < 1 ||
+    timeout > MAX_JOB_TIMEOUT_MINUTES
+  ) {
+    throw new InvalidRepoConfigError(
+      `${REPO_CONFIG_PATH}: "job_timeout_minutes" must be an integer between 1 and ${MAX_JOB_TIMEOUT_MINUTES}`,
+    );
+  }
+
+  const rawDevices = doc.devices;
+  if (!Array.isArray(rawDevices) || rawDevices.length === 0 || rawDevices.length > MAX_DEVICES) {
+    throw new InvalidRepoConfigError(
+      `${REPO_CONFIG_PATH}: "devices" must be an array of 1 to ${MAX_DEVICES} Device Farm ARNs`,
+    );
+  }
+  const devices = rawDevices.map((d) => {
+    if (typeof d !== "string" || !d.trim().startsWith("arn:aws:devicefarm:")) {
+      throw new InvalidRepoConfigError(
+        `${REPO_CONFIG_PATH}: every entry in "devices" must be an arn:aws:devicefarm: ARN`,
+      );
+    }
+    return d.trim();
+  });
+
+  const packageFilename = reqStr("package_filename");
+  if (
+    packageFilename.includes("/") ||
+    packageFilename.includes("\\") ||
+    packageFilename === "." ||
+    packageFilename === ".."
+  ) {
+    throw new InvalidRepoConfigError(
+      `${REPO_CONFIG_PATH}: "package_filename" must be a plain filename without path separators`,
+    );
+  }
+
+  return {
+    fullName: meta.fullName,
+    owner: parts.owner,
+    name: parts.name,
+    defaultBranch: meta.defaultBranch || "main",
+    projectArn: meta.projectArn,
+    workflowName: reqStr("workflow_name"),
+    triggerJob: reqStr("trigger_job"),
+    artifactName: reqStr("artifact_name"),
+    packageFilename,
+    testSpecPath: reqStr("test_spec_path"),
+    checkName: reqStr("check_name"),
+    jobTimeoutMinutes: timeout,
+    devices,
+  };
+}
+
+export async function fetchRepoConfig(
+  gh: Octokit,
+  fullName: string,
+  defaultBranch: string,
+  projectArn: string,
+): Promise<RepoConfig | null> {
+  const parts = splitRepo(fullName);
+  if (!parts) return null;
+  try {
+    const { data } = await gh.rest.repos.getContent({
+      owner: parts.owner,
+      repo: parts.name,
+      path: REPO_CONFIG_PATH,
+      ref: defaultBranch || "main",
+      mediaType: { format: "raw" },
+    });
+    const raw =
+      typeof data === "string" ? data : Buffer.from(data as unknown as Uint8Array).toString("utf8");
+    return parseRepoConfig(raw, { fullName, defaultBranch: defaultBranch || "main", projectArn });
+  } catch (err) {
+    if ((err as { status?: number })?.status === 404) return null;
+    throw err;
+  }
+}
+
+export function createCachedRepoConfigLoader(
+  getOctokit: (installationId: number) => Promise<Octokit>,
+  ttlMs = 60 * 1000,
+) {
+  const cache = new Map<string, { config: RepoConfig; expiresAt: number }>();
+  return async (
+    fullName: string,
+    defaultBranch: string,
+    projectArn: string,
+    installationId: number,
+  ): Promise<RepoConfig | null> => {
+    const key = `${fullName.toLowerCase()}@${defaultBranch || "main"}`;
+    const hit = cache.get(key);
+    if (hit && Date.now() < hit.expiresAt) return hit.config;
+    const config = await fetchRepoConfig(
+      await getOctokit(installationId),
+      fullName,
+      defaultBranch,
+      projectArn,
+    );
+    if (config) cache.set(key, { config, expiresAt: Date.now() + ttlMs });
+    return config;
+  };
 }
 
 export function createGitHubAuth(region: string, secretArn: string) {

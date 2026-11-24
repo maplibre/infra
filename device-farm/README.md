@@ -10,20 +10,22 @@ Run (`device-test / android`). The OpenTofu stack lives in
 One esbuild-bundled Node.js 22 ESM bundle (`nodejs22.x`, `arm64`, handler `index.handler`)
 runs in three modes selected by the `MODE` environment variable:
 
-1. **`webhook`** (`128 MB`, `10s` timeout, Lambda Function URL): validates
+1. **`webhook`** (`128 MB`, `15s` timeout, Lambda Function URL): validates
    `X-Hub-Signature-256` against the GitHub App webhook secret from Secrets Manager,
-   filters configured repositories and relevant events (`workflow_job` `completed`,
-   `workflow_run` `completed`, `check_run` `rerequested`), enqueues a compact JSON
-   job onto SQS, and returns `202 Accepted` in under a second.
+   checks the repository against `REPO_PROJECTS`, loads `.config/device-farm.toml`
+   from the repository's default branch (cached for 60s) for relevant events
+   (`workflow_job` `completed`, `workflow_run` `completed`, `check_run`
+   `rerequested`), enqueues a compact JSON job onto SQS, and returns `202 Accepted`.
 2. **`worker`** (`1024 MB`, `2048 MB /tmp`, `300s` timeout, SQS trigger with
    `batch_size = 1` and `ReportBatchItemFailures`): authenticates as the GitHub App
-   installation, deduplicates against existing DynamoDB runs, stops any earlier
-   `ACTIVE` runs on the same `(repo, head_repo, head_branch)`, downloads the
-   `android-device-tests` Actions artifact without leaking the GitHub
-   `Authorization` header to Azure Blob Storage, extracts `android-tests.zip`
-   without unpacking or executing its contents, fetches
-   `tools/device-farm/android.yml` from `main` (never from a PR branch), uploads
-   both to Device Farm, schedules the run, and records it in DynamoDB.
+   installation, loads `.config/device-farm.toml` from the repository's default
+   branch, deduplicates against existing DynamoDB runs, stops any earlier `ACTIVE`
+   runs on the same `(repo, head_repo, head_branch)`, downloads the configured
+   Actions artifact without leaking the GitHub `Authorization` header to Azure Blob
+   Storage, extracts the configured test package without unpacking or executing its
+   contents, fetches the configured test spec from the default branch (never from a
+   PR branch), uploads both to Device Farm, schedules the run, and records it in
+   DynamoDB.
 3. **`poller`** (`512 MB`, `1024 MB /tmp`, `120s` timeout, EventBridge `rate(1 minute)`):
    queries DynamoDB `state-index` for `ACTIVE` runs (exiting immediately when idle),
    checks `devicefarm:GetRun`, downloads `TESTSPEC_OUTPUT` and `CUSTOMER_ARTIFACT`
@@ -34,10 +36,13 @@ runs in three modes selected by the `MODE` environment variable:
 
 ### Security properties
 
-- Untrusted fork PR code is never executed inside Lambda. `android-tests.zip` is
-  transferred as an opaque file straight to Device Farm, and the test spec
-  (`tools/device-farm/android.yml`) is always fetched from the repository's default
-  branch (`main`).
+- Untrusted fork PR code is never executed inside Lambda. The test package is
+  transferred as an opaque file straight to Device Farm, and both
+  `.config/device-farm.toml` and the test spec are always fetched from the
+  repository's default branch (never from a PR branch).
+- `infra` owns the repository allowlist and AWS Device Farm project ARN mapping
+  (`repo_projects` in OpenTofu), plus guardrails on device count (max 10) and job
+  timeout (max 90 minutes).
 - Test outputs live in a private S3 bucket (`BlockPublicAccess` enabled, 30-day
   expiration) fronted by CloudFront Origin Access Control (OAC) with a response
   headers policy enforcing `Content-Security-Policy: sandbox` and
@@ -135,14 +140,30 @@ allowed_branches = ""
 Then run `just device-farm::plan` and `just device-farm::apply`, and add
 `device-test / android` to branch protection when ready.
 
+## Repository configuration (`.config/device-farm.toml`)
+
+Each onboarded repository provides its own `.config/device-farm.toml` on its
+default branch (always read from the default branch, never from a PR branch):
+
+```toml
+workflow_name = "ci"
+trigger_job = "prepare-device-tests"
+artifact_name = "android-device-tests"
+package_filename = "android-tests.zip"
+test_spec_path = "tools/device-farm/android.yml"
+check_name = "device-test / android"
+job_timeout_minutes = 60
+devices = [
+  "arn:aws:devicefarm:us-west-2::device:6D89F408709B4D3BBBBB17696A24B141", # Google Pixel 9
+  "arn:aws:devicefarm:us-west-2::device:092D78E7B4694568812D5FF0711CD346", # Samsung Galaxy S25
+]
+```
+
 ## Adding another repository (e.g. `maplibre/maplibre-native`)
 
-1. Add a `RepoConfig` entry to `cfg.repos` in [`src/config.ts`](src/config.ts)
-   (and read an optional project ARN env var such as `MAPLIBRE_NATIVE_PROJECT_ARN`
-   in `loadConfig`).
-2. Add the corresponding variable and Lambda environment variable in
-   [`../opentofu/device-farm/variables.tf`](../opentofu/device-farm/variables.tf)
-   and [`../opentofu/device-farm/main.tf`](../opentofu/device-farm/main.tf).
+1. Add the repository's `"owner/repo" = "<device-farm-project-arn>"` entry to
+   `repo_projects` in [`../opentofu/device-farm/variables.tf`](../opentofu/device-farm/variables.tf).
+2. Add `.config/device-farm.toml` (and the referenced test spec) to the target
+   repository's default branch.
 3. Install the GitHub App on the new repository.
-4. Run `just device-farm::check`, `just device-farm::plan`, and
-   `just device-farm::apply`.
+4. Run `just device-farm::plan` and `just device-farm::apply`.

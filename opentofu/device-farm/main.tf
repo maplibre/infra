@@ -304,7 +304,7 @@ resource "aws_lambda_function" "webhook" {
   filename         = local.lambda_zip_path
   source_code_hash = local.lambda_source_hash
   memory_size      = 128
-  timeout          = 10
+  timeout          = 15
 
   environment {
     variables = {
@@ -312,7 +312,7 @@ resource "aws_lambda_function" "webhook" {
       GITHUB_APP_SECRET_ARN = aws_secretsmanager_secret.github_app.arn
       JOBS_QUEUE_URL        = aws_sqs_queue.jobs.url
       ALLOWED_BRANCHES      = var.allowed_branches
-      MLN_RS_PROJECT_ARN    = var.mln_rs_project_arn
+      REPO_PROJECTS         = jsonencode(var.repo_projects)
     }
   }
 
@@ -426,7 +426,7 @@ resource "aws_lambda_function" "worker" {
       GITHUB_APP_SECRET_ARN = aws_secretsmanager_secret.github_app.arn
       RUNS_TABLE_NAME       = aws_dynamodb_table.runs.name
       ALLOWED_BRANCHES      = var.allowed_branches
-      MLN_RS_PROJECT_ARN    = var.mln_rs_project_arn
+      REPO_PROJECTS         = jsonencode(var.repo_projects)
     }
   }
 
@@ -512,7 +512,6 @@ resource "aws_lambda_function" "poller" {
       RUNS_TABLE_NAME       = aws_dynamodb_table.runs.name
       RESULTS_BUCKET_NAME   = aws_s3_bucket.results.bucket
       RESULTS_BASE_URL      = "https://${aws_cloudfront_distribution.results.domain_name}"
-      MLN_RS_PROJECT_ARN    = var.mln_rs_project_arn
     }
   }
 

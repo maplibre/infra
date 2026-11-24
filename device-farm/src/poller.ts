@@ -11,7 +11,7 @@ import {
 } from "@aws-sdk/client-device-farm";
 import { PutObjectCommand, type S3Client } from "@aws-sdk/client-s3";
 import type { Octokit } from "octokit";
-import { type Config, lookupRepo, type RunRecord } from "./config.js";
+import { type Config, type RunRecord, splitRepo } from "./config.js";
 import {
   buildCheckOutput,
   consoleUrl,
@@ -76,7 +76,7 @@ async function pollRun(
   if (!run) return void (await store.markCompleted(rec.run_arn, "NOT_FOUND"));
   if (run.status !== "COMPLETED") return;
 
-  const repo = lookupRepo(cfg, rec.repo);
+  const repo = splitRepo(rec.repo);
   if (!repo) return void (await store.markCompleted(rec.run_arn, run.result ?? "UNKNOWN"));
 
   const putS3 = (

@@ -4,10 +4,12 @@ variable "allowed_branches" {
   default     = ""
 }
 
-variable "mln_rs_project_arn" {
-  description = "AWS Device Farm project ARN for maplibre/mln-rs."
-  type        = string
-  default     = "arn:aws:devicefarm:us-west-2:373521797162:project:c5c3f5f6-e21b-41c4-a235-489d30075aeb"
+variable "repo_projects" {
+  description = "Map of allowed GitHub repositories (owner/repo) to AWS Device Farm project ARNs."
+  type        = map(string)
+  default = {
+    "maplibre/mln-rs" = "arn:aws:devicefarm:us-west-2:373521797162:project:c5c3f5f6-e21b-41c4-a235-489d30075aeb"
+  }
 }
 
 variable "lambda_package_path" {
