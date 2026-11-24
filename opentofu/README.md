@@ -2,7 +2,8 @@
 
 Each directory is an independent root with its own provider lockfile and S3 state
 key. `bootstrap/` manages the shared state bucket; `ctcache/` and `forgejo/` manage
-servers; `github-actions/` manages the IAM roles that GitHub Actions assumes.
+servers; `github-actions/` manages the IAM roles that GitHub Actions assumes and
+the environments that select them, and mln-rs's Device Farm project.
 Service-specific NixOS configuration, operator scripts and deployment notes live
 in [`../ctcache/`](../ctcache/README.md) and [`../forgejo/`](../forgejo/README.md).
 Add future stacks alongside these roots with a distinct state key. Keep shared

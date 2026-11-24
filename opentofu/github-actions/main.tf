@@ -17,7 +17,15 @@ provider "aws" {
   allowed_account_ids = ["373521797162"]
   default_tags { tags = { Project = "maplibre-github-actions", ManagedBy = "OpenTofu" } }
 }
-# Authenticates with GITHUB_TOKEN, which needs admin access to maplibre/maplibre-native.
+# Device Farm's only region.
+provider "aws" {
+  alias               = "device_farm"
+  region              = "us-west-2"
+  allowed_account_ids = ["373521797162"]
+  default_tags { tags = { Project = "maplibre-github-actions", ManagedBy = "OpenTofu" } }
+}
+# Authenticates with GITHUB_TOKEN, which needs admin access to the repositories
+# in local.workflow_run_repositories.
 provider "github" {
   owner = "maplibre"
 }
@@ -25,9 +33,13 @@ data "aws_iam_openid_connect_provider" "github" {
   url = "https://token.actions.githubusercontent.com"
 }
 locals {
-  issuer               = "token.actions.githubusercontent.com"
-  workflow_run_subject = "repo:maplibre/maplibre-native:environment:${github_repository_environment.workflow_run.environment}"
-  device_farm_project  = "20687d72-0e46-403e-8f03-0941850665bc"
+  issuer = "token.actions.githubusercontent.com"
+  # The repositories whose workflow-run environment gets the narrower role.
+  workflow_run_repositories = toset(["maplibre-native", "mln-rs"])
+  workflow_run_subjects = { for repository, environment in github_repository_environment.workflow_run :
+  repository => "repo:maplibre/${repository}:environment:${environment.environment}" }
+  # maplibre-native's project, which this stack doesn't manage, and mln-rs's.
+  device_farm_projects = ["20687d72-0e46-403e-8f03-0941850665bc", split(":", aws_devicefarm_project.mln_rs.arn)[6]]
 }
 import {
   to = aws_iam_role.github_actions
@@ -47,7 +59,7 @@ resource "aws_iam_role" "github_actions" {
       StringEquals = { "${local.issuer}:aud" = "sts.amazonaws.com" }
       StringLike   = { "${local.issuer}:sub" = ["repo:maplibre/maplibre-native:*", "repo:maplibre/maplibre-native-qt:*"] }
       # Jobs in the workflow-run environment must only get the narrower role.
-      StringNotEquals = { "${local.issuer}:sub" = local.workflow_run_subject }
+      StringNotEquals = { "${local.issuer}:sub" = local.workflow_run_subjects["maplibre-native"] }
     }
   }] })
 }
@@ -61,8 +73,9 @@ resource "aws_iam_role_policy_attachments_exclusive" "github_actions" {
     "arn:aws:iam::373521797162:policy/github-actions-s3-buckets",
   ]
 }
-# maplibre-native's workflow_run jobs handle artifacts that fork pull requests
-# control, so they can only publish results and run device tests.
+# The workflow_run jobs of local.workflow_run_repositories handle artifacts
+# that fork pull requests control, so they can only publish maplibre-native's
+# results and run device tests.
 resource "aws_iam_role" "workflow_run" {
   name                 = "GitHubActionsWorkflowRun"
   max_session_duration = 14400 # device tests request four-hour sessions
@@ -71,7 +84,7 @@ resource "aws_iam_role" "workflow_run" {
     Principal = { Federated = data.aws_iam_openid_connect_provider.github.arn }
     Condition = { StringEquals = {
       "${local.issuer}:aud" = "sts.amazonaws.com"
-      "${local.issuer}:sub" = local.workflow_run_subject
+      "${local.issuer}:sub" = values(local.workflow_run_subjects)
     } }
   }] })
 }
@@ -88,13 +101,43 @@ resource "aws_iam_role_policy" "workflow_run" {
       Sid = "RunDeviceTests", Effect = "Allow"
       Action = [for action in ["CreateUpload", "GetUpload", "ScheduleRun", "GetRun", "ListJobs", "ListSuites", "ListArtifacts"] :
       "devicefarm:${action}"]
-      Resource = [for type in ["project", "upload", "devicepool", "run", "job", "suite", "test"] :
-      "arn:aws:devicefarm:us-west-2:373521797162:${type}:${local.device_farm_project}*"]
+      Resource = flatten([for project in local.device_farm_projects : [
+        for type in ["project", "upload", "devicepool", "run", "job", "suite", "test"] :
+      "arn:aws:devicefarm:us-west-2:373521797162:${type}:${project}*"]])
+    },
+    {
+      # mln-rs's workflow stops the run it scheduled when the workflow is cancelled.
+      Sid      = "StopDeviceTests", Effect = "Allow", Action = "devicefarm:StopRun"
+      Resource = "arn:aws:devicefarm:us-west-2:373521797162:run:${split(":", aws_devicefarm_project.mln_rs.arn)[6]}*"
     },
   ] })
 }
+# mln-rs's tests run on phones in a project of their own.
+import {
+  provider = aws.device_farm
+  to       = aws_devicefarm_project.mln_rs
+  id       = "arn:aws:devicefarm:us-west-2:373521797162:project:c5c3f5f6-e21b-41c4-a235-489d30075aeb"
+}
+resource "aws_devicefarm_project" "mln_rs" {
+  provider                    = aws.device_farm
+  name                        = "mln-rs"
+  default_job_timeout_minutes = 60
+}
+moved {
+  from = github_repository_environment.workflow_run
+  to   = github_repository_environment.workflow_run["maplibre-native"]
+}
+moved {
+  from = github_repository_environment_deployment_policy.workflow_run
+  to   = github_repository_environment_deployment_policy.workflow_run["maplibre-native"]
+}
+moved {
+  from = github_actions_environment_variable.workflow_run_role
+  to   = github_actions_environment_variable.workflow_run_role["maplibre-native"]
+}
 resource "github_repository_environment" "workflow_run" {
-  repository  = "maplibre-native"
+  for_each    = local.workflow_run_repositories
+  repository  = each.key
   environment = "workflow-run"
   deployment_branch_policy {
     protected_branches     = false
@@ -102,14 +145,22 @@ resource "github_repository_environment" "workflow_run" {
   }
 }
 resource "github_repository_environment_deployment_policy" "workflow_run" {
-  repository     = github_repository_environment.workflow_run.repository
-  environment    = github_repository_environment.workflow_run.environment
+  for_each       = github_repository_environment.workflow_run
+  repository     = each.value.repository
+  environment    = each.value.environment
   branch_pattern = "main"
 }
 # Takes precedence over the repository variable for jobs in the environment.
 resource "github_actions_environment_variable" "workflow_run_role" {
-  repository    = github_repository_environment.workflow_run.repository
-  environment   = github_repository_environment.workflow_run.environment
+  for_each      = github_repository_environment.workflow_run
+  repository    = each.value.repository
+  environment   = each.value.environment
   variable_name = "OIDC_AWS_ROLE_TO_ASSUME"
   value         = aws_iam_role.workflow_run.arn
+}
+resource "github_actions_environment_variable" "mln_rs_device_farm_project" {
+  repository    = github_repository_environment.workflow_run["mln-rs"].repository
+  environment   = github_repository_environment.workflow_run["mln-rs"].environment
+  variable_name = "AWS_DEVICE_FARM_PROJECT_ARN"
+  value         = aws_devicefarm_project.mln_rs.arn
 }
