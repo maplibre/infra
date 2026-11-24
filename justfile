@@ -4,6 +4,7 @@ set positional-arguments
 mod ctcache 'ctcache/justfile'
 mod device-farm 'device-farm/justfile'
 mod forgejo 'forgejo/justfile'
+mod github-actions 'github-actions/justfile'
 
 # List shared infrastructure commands.
 default:
@@ -14,7 +15,7 @@ dev:
     nix develop ./ctcache/nix
 
 # Connect every stack to its S3 state key.
-init: ctcache::init device-farm::init forgejo::init
+init: ctcache::init device-farm::init forgejo::init github-actions::init
     tofu -chdir=opentofu/bootstrap init
 
 # Plan changes to the shared state bucket.
@@ -40,6 +41,6 @@ fmt: ctcache::fmt device-farm::fmt forgejo::fmt
     tofu fmt -recursive opentofu
 
 # Check configuration and synchronization scripts without changing infrastructure.
-check: ctcache::check device-farm::check forgejo::check
+check: ctcache::check device-farm::check forgejo::check github-actions::check
     tofu fmt -check -recursive opentofu
     tofu -chdir=opentofu/bootstrap validate
