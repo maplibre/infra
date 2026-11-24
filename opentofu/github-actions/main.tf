@@ -29,15 +29,30 @@ provider "aws" {
 provider "github" {
   owner = "maplibre"
 }
+data "github_organization" "maplibre" {
+  name         = "maplibre"
+  summary_only = true
+}
+data "github_repository" "workflow_run" {
+  for_each  = local.workflow_run_repositories
+  full_name = "maplibre/${each.key}"
+}
 data "aws_iam_openid_connect_provider" "github" {
   url = "https://token.actions.githubusercontent.com"
 }
 locals {
   issuer = "token.actions.githubusercontent.com"
-  # The repositories whose workflow-run environment gets the narrower role.
-  workflow_run_repositories = toset(["maplibre-native", "mln-rs"])
+  # The repositories whose workflow-run environment gets the narrower role, and
+  # whether GitHub gives them immutable OIDC subjects (a repository's setting),
+  # which name the owner and the repository by ID too: repo:OWNER@ID/REPO@ID.
+  workflow_run_repositories = { "maplibre-native" = false, "mln-rs" = true }
   workflow_run_subjects = { for repository, environment in github_repository_environment.workflow_run :
-  repository => "repo:maplibre/${repository}:environment:${environment.environment}" }
+    repository => join(":", [
+      local.workflow_run_repositories[repository]
+      ? "repo:maplibre@${data.github_organization.maplibre.id}/${repository}@${data.github_repository.workflow_run[repository].repo_id}"
+      : "repo:maplibre/${repository}",
+      "environment", environment.environment,
+  ]) }
   # maplibre-native's project, which this stack doesn't manage, and mln-rs's.
   device_farm_projects = ["20687d72-0e46-403e-8f03-0941850665bc", split(":", aws_devicefarm_project.mln_rs.arn)[6]]
 }
