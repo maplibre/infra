@@ -47,8 +47,6 @@ const (
 	StateActive RunState = "ACTIVE"
 	// StateCompleted marks a finished Device Farm run whose Check Run was settled.
 	StateCompleted RunState = "COMPLETED"
-	// StateSuperseded marks an active run stopped because a newer commit arrived.
-	StateSuperseded RunState = "SUPERSEDED"
 	// StateFailed marks a run that failed unexpectedly (e.g. deleted from Device Farm).
 	StateFailed RunState = "FAILED"
 )

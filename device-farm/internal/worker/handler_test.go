@@ -39,6 +39,8 @@ type fakeGH struct {
 	lastWorkflowRunID  int64
 	lastJobsRunID      int64
 	lastJobsAttempt    int
+	listArtifactsCalls int
+	downloadCalls      int
 }
 
 func newFakeGH() *fakeGH {
@@ -110,11 +112,15 @@ func (f *fakeGH) ListWorkflowRunJobs(_ context.Context, _ int64, _, _ string, ru
 }
 
 func (f *fakeGH) ListWorkflowRunArtifacts(_ context.Context, _ int64, _, _ string, _ int64, _ string) ([]github.Artifact, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listArtifactsCalls++
 	return f.artifacts, nil
 }
 
 func (f *fakeGH) DownloadArtifact(_ context.Context, _ int64, _, _ string, _ int64, dstPath string, _ int64) error {
 	f.mu.Lock()
+	f.downloadCalls++
 	err := f.downloadErr
 	hook := f.onDownload
 	f.mu.Unlock()
@@ -146,20 +152,18 @@ func (f *fakeGH) GetRawFile(_ context.Context, _ int64, _, _, _, ref string) ([]
 }
 
 type fakeStore struct {
-	mu              sync.Mutex
-	records         map[string]model.RunRecord
-	getRunOverrides map[string]model.RunRecord
-	putRunErr       error
-	onPutRun        func()
-	releaseCtxErrs  []error
-	releaseCalls    int
-	completeCalls   int
+	mu             sync.Mutex
+	records        map[string]model.RunRecord
+	putRunErr      error
+	onPutRun       func()
+	releaseCtxErrs []error
+	releaseCalls   int
+	completeCalls  int
 }
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		records:         make(map[string]model.RunRecord),
-		getRunOverrides: make(map[string]model.RunRecord),
+		records: make(map[string]model.RunRecord),
 	}
 }
 
@@ -228,16 +232,6 @@ func (s *fakeStore) PutRun(_ context.Context, rec model.RunRecord) error {
 	return nil
 }
 
-func (s *fakeStore) GetRun(_ context.Context, runARN string) (model.RunRecord, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if rec, ok := s.getRunOverrides[runARN]; ok {
-		return rec, true, nil
-	}
-	rec, ok := s.records[runARN]
-	return rec, ok, nil
-}
-
 func (s *fakeStore) QueryActiveByBranchKey(_ context.Context, branchKey string) ([]model.RunRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -263,20 +257,11 @@ func (s *fakeStore) QueryByRepoSHA(_ context.Context, repo, sha string) ([]model
 	return out, nil
 }
 
-func (s *fakeStore) MarkSuperseded(_ context.Context, arn string, completedAt time.Time) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	r := s.records[arn]
-	r.State = model.StateSuperseded
-	r.CompletedAt = completedAt.UTC().Format(time.RFC3339Nano)
-	s.records[arn] = r
-	return nil
-}
-
 type fakeDF struct {
 	mu          sync.Mutex
 	uploads     []dftypes.UploadType
 	uploadErr   error
+	stopErr     error
 	stoppedARNs []string
 	stopCtxErrs []error
 	scheduledIn []devicefarm.ScheduleInput
@@ -310,7 +295,7 @@ func (d *fakeDF) StopRun(ctx context.Context, arn string) error {
 	defer d.mu.Unlock()
 	d.stoppedARNs = append(d.stoppedARNs, arn)
 	d.stopCtxErrs = append(d.stopCtxErrs, ctx.Err())
-	return nil
+	return d.stopErr
 }
 
 func testWorkerCfg() config.Config {
@@ -391,15 +376,16 @@ func TestWorkerSchedulesAndSupersedesOlderRun(t *testing.T) {
 		t.Fatalf("Handle() err=%v failures=%v", err, resp.BatchItemFailures)
 	}
 
-	// Verify old run was superseded and stopped.
+	// Verify old run was stopped on Device Farm, while DynamoDB state and its Check Run
+	// are left untouched for the poller (sole writer for ACTIVE runs) to settle.
 	if len(df.stoppedARNs) != 1 || df.stoppedARNs[0] != oldARN {
 		t.Fatalf("stoppedARNs = %v, want [%s]", df.stoppedARNs, oldARN)
 	}
-	if st.records[oldARN].State != model.StateSuperseded {
-		t.Fatalf("old state = %s, want SUPERSEDED", st.records[oldARN].State)
+	if st.records[oldARN].State != model.StateActive {
+		t.Fatalf("old state = %s, want ACTIVE (poller settles stopped runs)", st.records[oldARN].State)
 	}
-	if updates := gh.updated[42]; len(updates) != 1 || updates[0].Conclusion != "cancelled" {
-		t.Fatalf("expected old check run 42 cancelled, got %+v", updates)
+	if updates := gh.updated[42]; len(updates) != 0 {
+		t.Fatalf("expected worker not to update old check run 42 directly, got %+v", updates)
 	}
 
 	// Verify test spec was fetched from main (NEVER PR branch).
@@ -1310,134 +1296,148 @@ func TestWorkerRerunDeliveryDeduplication(t *testing.T) {
 	})
 }
 
-func TestWorkerSupersedeActiveRunsOrderingAndRetry(t *testing.T) {
+func TestWorkerStopSupersededRunsLeavesStateToPoller(t *testing.T) {
 	t1 := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
 	t2 := t1.Add(5 * time.Minute)
 
-	t.Run("UpdateCheckRun failure keeps superseded run ACTIVE and retries cleanly", func(t *testing.T) {
+	gh := newFakeGH()
+	gh.workflowRun = github.WorkflowRun{ID: 510, RunAttempt: 1, HeadBranch: "feature", HeadSHA: "new-sha", CreatedAt: t2}
+	gh.workflowRun.HeadRepository.FullName = "fork/mln-rs"
+	gh.artifacts = []github.Artifact{{ID: 61, Name: "android-device-tests", CreatedAt: t2}}
+	// Even if UpdateCheckRun on old check 42 would fail, worker must never call it.
+	gh.updateErrByCheckID[42] = errors.New("should not be called")
+
+	st := newFakeStore()
+	oldARN := "arn:aws:devicefarm:us-west-2:373521797162:run:proj/old-run"
+	st.records[oldARN] = model.RunRecord{
+		RunARN:            oldARN,
+		State:             model.StateActive,
+		BranchKey:         model.BranchKey("maplibre/mln-rs", "fork/mln-rs", "feature"),
+		RepoSHA:           model.RepoSHAKey("maplibre/mln-rs", "old-sha"),
+		Repo:              "maplibre/mln-rs",
+		SHA:               "old-sha",
+		WorkflowRunID:     509,
+		WorkflowCreatedAt: t1.Format(time.RFC3339),
+		CheckRunID:        42,
+		InstallationID:    99,
+	}
+	// StopRun error is logged and does not block scheduling the newer run.
+	df := &fakeDF{stopErr: errors.New("already completed on device farm")}
+	h := NewHandler(testWorkerCfg(), gh, st, df, nil)
+
+	resp, err := h.Handle(context.Background(), sqsEventOf(t, model.JobMessage{
+		Event:              model.EventWorkflowJob,
+		Action:             "completed",
+		Repo:               "maplibre/mln-rs",
+		InstallationID:     99,
+		HeadSHA:            "new-sha",
+		HeadBranch:         "feature",
+		WorkflowRunID:      510,
+		WorkflowRunAttempt: 1,
+		JobConclusion:      "success",
+	}))
+	if err != nil || len(resp.BatchItemFailures) != 0 {
+		t.Fatalf("Handle() err=%v failures=%v", err, resp.BatchItemFailures)
+	}
+	if len(df.stoppedARNs) != 1 || df.stoppedARNs[0] != oldARN {
+		t.Fatalf("stoppedARNs = %v, want [%s]", df.stoppedARNs, oldARN)
+	}
+	if st.records[oldARN].State != model.StateActive {
+		t.Fatalf("old run state = %s, want ACTIVE so poller settles it", st.records[oldARN].State)
+	}
+	if len(gh.updated[42]) != 0 {
+		t.Fatalf("expected worker not to update old check run 42, got %+v", gh.updated[42])
+	}
+	if len(df.scheduledIn) != 1 {
+		t.Fatalf("expected 1 new run scheduled, got %d", len(df.scheduledIn))
+	}
+}
+
+func TestWorkerRejectsSupersededWorkflowAttempt(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+
+	t.Run("delayed normal workflow_job for older attempt cancels check without listing artifacts", func(t *testing.T) {
 		gh := newFakeGH()
-		gh.workflowRun = github.WorkflowRun{ID: 510, RunAttempt: 1, HeadBranch: "feature", HeadSHA: "new-sha", CreatedAt: t2}
-		gh.workflowRun.HeadRepository.FullName = "fork/mln-rs"
-		gh.artifacts = []github.Artifact{{ID: 61, Name: "android-device-tests", CreatedAt: t2}}
-		gh.updateErrByCheckID[42] = errors.New("github 502")
+		gh.workflowRun = github.WorkflowRun{
+			ID:         610,
+			RunAttempt: 2, // newer attempt already exists
+			HeadBranch: "main",
+			HeadSHA:    "attempt-sha",
+			CreatedAt:  now,
+		}
+		gh.workflowRun.HeadRepository.FullName = "maplibre/mln-rs"
+		gh.artifacts = []github.Artifact{{ID: 71, Name: "android-device-tests", CreatedAt: now}}
 
 		st := newFakeStore()
-		oldARN := "arn:aws:devicefarm:us-west-2:373521797162:run:proj/old-run"
-		st.records[oldARN] = model.RunRecord{
-			RunARN:            oldARN,
-			State:             model.StateActive,
-			BranchKey:         model.BranchKey("maplibre/mln-rs", "fork/mln-rs", "feature"),
-			RepoSHA:           model.RepoSHAKey("maplibre/mln-rs", "old-sha"),
-			Repo:              "maplibre/mln-rs",
-			SHA:               "old-sha",
-			WorkflowRunID:     509,
-			WorkflowCreatedAt: t1.Format(time.RFC3339),
-			CheckRunID:        42,
-			InstallationID:    99,
-		}
 		df := &fakeDF{}
 		h := NewHandler(testWorkerCfg(), gh, st, df, nil)
-
-		msg := model.JobMessage{
-			Event:              model.EventWorkflowJob,
-			Action:             "completed",
-			Repo:               "maplibre/mln-rs",
-			InstallationID:     99,
-			HeadSHA:            "new-sha",
-			HeadBranch:         "feature",
-			WorkflowRunID:      510,
-			WorkflowRunAttempt: 1,
-			JobConclusion:      "success",
-		}
-
-		// First attempt: UpdateCheckRun on check 42 fails -> returns batch failure, old run stays ACTIVE, claim released.
-		resp, err := h.Handle(context.Background(), sqsEventOf(t, msg))
-		if err != nil || len(resp.BatchItemFailures) != 1 {
-			t.Fatalf("expected 1 batch failure when cancelling superseded check run fails, got err=%v failures=%v", err, resp.BatchItemFailures)
-		}
-		if st.records[oldARN].State != model.StateActive {
-			t.Fatalf("old run state = %s, want ACTIVE so retry/poller can settle check run", st.records[oldARN].State)
-		}
-		if len(df.stoppedARNs) != 1 || df.stoppedARNs[0] != oldARN {
-			t.Fatalf("expected StopRun called before UpdateCheckRun, got %v", df.stoppedARNs)
-		}
-		if len(df.scheduledIn) != 0 {
-			t.Fatalf("expected 0 schedules before retry, got %d", len(df.scheduledIn))
-		}
-		if _, stillClaimed := st.records[model.ClaimKey("maplibre/mln-rs", 510, 1)]; stillClaimed {
-			t.Fatal("expected claim to be released after supersede UpdateCheckRun failure")
-		}
-
-		// Retry after GitHub recovers: old check run cancelled, old record marked SUPERSEDED, new run scheduled.
-		delete(gh.updateErrByCheckID, 42)
-		resp, err = h.Handle(context.Background(), sqsEventOf(t, msg))
-		if err != nil || len(resp.BatchItemFailures) != 0 {
-			t.Fatalf("retry failed: err=%v failures=%v", err, resp.BatchItemFailures)
-		}
-		if st.records[oldARN].State != model.StateSuperseded {
-			t.Fatalf("old run state after retry = %s, want SUPERSEDED", st.records[oldARN].State)
-		}
-		if updates := gh.updated[42]; len(updates) != 1 || updates[0].Conclusion != "cancelled" {
-			t.Fatalf("expected old check run 42 cancelled on retry, got %+v", updates)
-		}
-		if len(df.scheduledIn) != 1 {
-			t.Fatalf("expected 1 run scheduled on retry, got %d", len(df.scheduledIn))
-		}
-	})
-
-	t.Run("skips run that GetRun shows already COMPLETED", func(t *testing.T) {
-		gh := newFakeGH()
-		gh.workflowRun = github.WorkflowRun{ID: 511, RunAttempt: 1, HeadBranch: "feature", HeadSHA: "new-sha-2", CreatedAt: t2}
-		gh.workflowRun.HeadRepository.FullName = "fork/mln-rs"
-		gh.artifacts = []github.Artifact{{ID: 62, Name: "android-device-tests", CreatedAt: t2}}
-
-		st := newFakeStore()
-		finishedARN := "arn:aws:devicefarm:us-west-2:373521797162:run:proj/just-finished"
-		baseRec := model.RunRecord{
-			RunARN:            finishedARN,
-			State:             model.StateActive, // stale GSI view
-			BranchKey:         model.BranchKey("maplibre/mln-rs", "fork/mln-rs", "feature"),
-			RepoSHA:           model.RepoSHAKey("maplibre/mln-rs", "old-sha-2"),
-			Repo:              "maplibre/mln-rs",
-			SHA:               "old-sha-2",
-			WorkflowRunID:     508,
-			WorkflowCreatedAt: t1.Format(time.RFC3339),
-			CheckRunID:        43,
-			InstallationID:    99,
-		}
-		st.records[finishedARN] = baseRec
-		completedRec := baseRec
-		completedRec.State = model.StateCompleted
-		st.getRunOverrides[finishedARN] = completedRec
-
-		df := &fakeDF{}
-		h := NewHandler(testWorkerCfg(), gh, st, df, nil)
+		h.now = func() time.Time { return now }
 
 		resp, err := h.Handle(context.Background(), sqsEventOf(t, model.JobMessage{
 			Event:              model.EventWorkflowJob,
 			Action:             "completed",
 			Repo:               "maplibre/mln-rs",
 			InstallationID:     99,
-			HeadSHA:            "new-sha-2",
-			HeadBranch:         "feature",
-			WorkflowRunID:      511,
+			HeadSHA:            "attempt-sha",
+			HeadBranch:         "main",
+			WorkflowRunID:      610,
 			WorkflowRunAttempt: 1,
 			JobConclusion:      "success",
 		}))
 		if err != nil || len(resp.BatchItemFailures) != 0 {
 			t.Fatalf("Handle() err=%v failures=%v", err, resp.BatchItemFailures)
 		}
-		if len(df.stoppedARNs) != 0 {
-			t.Fatalf("expected 0 StopRun calls for already COMPLETED run, got %v", df.stoppedARNs)
+		if gh.listArtifactsCalls != 0 || gh.downloadCalls != 0 || len(df.scheduledIn) != 0 || len(df.stoppedARNs) != 0 {
+			t.Fatalf("expected no artifact list/download or Device Farm calls, got list=%d dl=%d sched=%d stops=%d",
+				gh.listArtifactsCalls, gh.downloadCalls, len(df.scheduledIn), len(df.stoppedARNs))
 		}
-		if len(gh.updated[43]) != 0 {
-			t.Fatalf("expected completed check run 43 untouched, got %+v", gh.updated[43])
+		if len(gh.created) != 1 || gh.created[0].Conclusion != "cancelled" || gh.created[0].Output.Title != "Superseded" || !strings.Contains(gh.created[0].Output.Summary, "attempt 2") {
+			t.Fatalf("expected cancelled Superseded check run mentioning attempt 2, got %+v", gh.created)
 		}
-		if st.records[finishedARN].State == model.StateSuperseded {
-			t.Fatal("already COMPLETED run must not be marked SUPERSEDED")
+		if rec := st.records[model.ClaimKey("maplibre/mln-rs", 610, 1)]; rec.State != model.StateClaimed {
+			t.Fatalf("expected claim finalized to CLAIMED, got %+v", rec)
 		}
-		if len(df.scheduledIn) != 1 {
-			t.Fatalf("expected 1 new run scheduled, got %d", len(df.scheduledIn))
+	})
+
+	t.Run("rerequesting older attempt check fails with Unable to re-run without listing artifacts", func(t *testing.T) {
+		gh := newFakeGH()
+		gh.workflowRun = github.WorkflowRun{
+			ID:         611,
+			RunAttempt: 3, // newer attempt already exists
+			HeadBranch: "main",
+			HeadSHA:    "attempt-rerun-sha",
+			CreatedAt:  now,
+		}
+		gh.workflowRun.HeadRepository.FullName = "maplibre/mln-rs"
+		gh.artifacts = []github.Artifact{{ID: 72, Name: "android-device-tests", CreatedAt: now}}
+
+		st := newFakeStore()
+		df := &fakeDF{}
+		h := NewHandler(testWorkerCfg(), gh, st, df, nil)
+		h.now = func() time.Time { return now }
+
+		resp, err := h.Handle(context.Background(), sqsEventOf(t, model.JobMessage{
+			Event:          model.EventCheckRun,
+			Action:         "rerequested",
+			DeliveryID:     "rerun-old-attempt",
+			Repo:           "maplibre/mln-rs",
+			InstallationID: 99,
+			HeadSHA:        "attempt-rerun-sha",
+			CheckRunID:     50,
+			ExternalID:     "611:1",
+		}))
+		if err != nil || len(resp.BatchItemFailures) != 0 {
+			t.Fatalf("Handle() err=%v failures=%v", err, resp.BatchItemFailures)
+		}
+		if gh.listArtifactsCalls != 0 || gh.downloadCalls != 0 || len(df.scheduledIn) != 0 || len(df.stoppedARNs) != 0 {
+			t.Fatalf("expected no artifact list/download or Device Farm calls, got list=%d dl=%d sched=%d stops=%d",
+				gh.listArtifactsCalls, gh.downloadCalls, len(df.scheduledIn), len(df.stoppedARNs))
+		}
+		if len(gh.created) != 1 || gh.created[0].Conclusion != "failure" || gh.created[0].Output.Title != "Unable to re-run" || !strings.Contains(gh.created[0].Output.Summary, "newer attempt (3)") {
+			t.Fatalf("expected failure Unable to re-run check run mentioning newer attempt 3, got %+v", gh.created)
+		}
+		if rec := st.records[model.RerunClaimKey("maplibre/mln-rs", "rerun-old-attempt")]; rec.State != model.StateClaimed {
+			t.Fatalf("expected rerun claim finalized to CLAIMED, got %+v", rec)
 		}
 	})
 }

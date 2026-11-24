@@ -250,11 +250,6 @@ func (s *Store) QueryByRepoSHA(ctx context.Context, repo, sha string) ([]model.R
 	})
 }
 
-// MarkSuperseded transitions an ACTIVE run to SUPERSEDED atomically.
-func (s *Store) MarkSuperseded(ctx context.Context, runARN string, completedAt time.Time) error {
-	return s.transitionFromActive(ctx, runARN, model.StateSuperseded, "STOPPED", completedAt)
-}
-
 // MarkCompleted transitions an ACTIVE run to COMPLETED atomically.
 func (s *Store) MarkCompleted(ctx context.Context, runARN, result string, completedAt time.Time) error {
 	return s.transitionFromActive(ctx, runARN, model.StateCompleted, result, completedAt)

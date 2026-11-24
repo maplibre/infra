@@ -48,10 +48,8 @@ type StoreAPI interface {
 	CompleteWorkflowClaim(ctx context.Context, claimKey, owner string, now time.Time) error
 	ReleaseWorkflowClaim(ctx context.Context, claimKey, owner string) error
 	PutRun(ctx context.Context, rec model.RunRecord) error
-	GetRun(ctx context.Context, runARN string) (model.RunRecord, bool, error)
 	QueryActiveByBranchKey(ctx context.Context, branchKey string) ([]model.RunRecord, error)
 	QueryByRepoSHA(ctx context.Context, repo, sha string) ([]model.RunRecord, error)
-	MarkSuperseded(ctx context.Context, runARN string, completedAt time.Time) error
 }
 
 // DeviceFarmAPI is the subset of Device Farm operations needed by worker.
@@ -394,6 +392,39 @@ func (h *Handler) scheduleDeviceFarmRun(ctx context.Context, repo config.RepoCon
 		}
 	}
 
+	// GitHub's ListWorkflowRunArtifacts API is run-wide and does not identify which
+	// attempt produced each artifact. If a newer attempt already exists, reject or
+	// supersede this older attempt before creating checks, stopping runs, or listing artifacts.
+	if wfRun.RunAttempt > runAttempt {
+		var existingCheckRunID int64
+		if !isRerun || msg.DeliveryID != "" {
+			_, existingCheckRunID, err = h.findCheckRunForExternalID(ctx, repo, msg.InstallationID, headSHA, extID)
+			if err != nil {
+				releaseClaim()
+				return err
+			}
+		}
+		var conclusion, title, summary string
+		if !isRerun {
+			conclusion = "cancelled"
+			title = "Superseded"
+			summary = fmt.Sprintf("Superseded by workflow run attempt %d.", wfRun.RunAttempt)
+		} else {
+			conclusion = "failure"
+			title = "Unable to re-run"
+			summary = fmt.Sprintf("Workflow run %d already has a newer attempt (%d), so attempt %d's artifact can no longer be uniquely identified. Re-run the latest attempt's check instead.", msg.WorkflowRunID, wfRun.RunAttempt, runAttempt)
+		}
+		if _, err := h.completeCheckRun(ctx, repo, msg.InstallationID, headSHA, extID, existingCheckRunID,
+			conclusion, title, summary); err != nil {
+			releaseClaim()
+			return err
+		}
+		completeClaim()
+		h.logger.Info("skipped scheduling superseded workflow attempt",
+			"repo", repo.FullName, "workflow_run_id", msg.WorkflowRunID, "run_attempt", runAttempt, "latest_attempt", wfRun.RunAttempt, "is_rerun", isRerun)
+		return nil
+	}
+
 	// Check active runs on the same branch before creating checks or stopping anything.
 	branchKey := model.BranchKey(repo.FullName, headRepo, headBranch)
 	var activeOnBranch []model.RunRecord
@@ -441,10 +472,7 @@ func (h *Handler) scheduleDeviceFarmRun(ctx context.Context, repo config.RepoCon
 		return err
 	}
 
-	if err := h.supersedeActiveRuns(ctx, repo, activeOnBranch, headSHA, workflowCreatedAt, msg.WorkflowRunID, isRerun); err != nil {
-		releaseClaim()
-		return err
-	}
+	h.stopSupersededRuns(ctx, activeOnBranch, workflowCreatedAt, msg.WorkflowRunID, isRerun)
 
 	artifacts, err := h.gh.ListWorkflowRunArtifacts(ctx, msg.InstallationID, repo.Owner, repo.Name, msg.WorkflowRunID, repo.ArtifactName)
 	if err != nil {
@@ -637,8 +665,10 @@ func (h *Handler) scheduleDeviceFarmRun(ctx context.Context, repo config.RepoCon
 	return nil
 }
 
-func (h *Handler) supersedeActiveRuns(ctx context.Context, repo config.RepoConfig, active []model.RunRecord, newSHA string, incomingCreatedAt time.Time, incomingRunID int64, isRerun bool) error {
-	now := h.now().UTC()
+// stopSupersededRuns requests AWS Device Farm to stop older ACTIVE runs on the
+// branch. The poller remains the sole writer for ACTIVE runs and settles both
+// GitHub Check Runs and DynamoDB state once Device Farm reports the final result.
+func (h *Handler) stopSupersededRuns(ctx context.Context, active []model.RunRecord, incomingCreatedAt time.Time, incomingRunID int64, isRerun bool) {
 	for _, earlier := range active {
 		if !model.IsDeviceFarmARN(earlier.RunARN) {
 			continue
@@ -646,43 +676,10 @@ func (h *Handler) supersedeActiveRuns(ctx context.Context, repo config.RepoConfi
 		if !isRerun && isNewerWorkflowRun(earlier, incomingCreatedAt, incomingRunID) {
 			continue
 		}
-		current, ok, err := h.store.GetRun(ctx, earlier.RunARN)
-		if err != nil {
-			return err
-		}
-		if !ok || current.State != model.StateActive {
-			continue
-		}
 		if err := h.df.StopRun(ctx, earlier.RunARN); err != nil {
 			h.logger.Warn("failed to stop superseded Device Farm run", "run_arn", earlier.RunARN, "err", err)
 		}
-		if earlier.CheckRunID > 0 && earlier.InstallationID > 0 {
-			summary := fmt.Sprintf("Superseded by newer commit %s", shortSHA(newSHA))
-			if earlier.SHA == newSHA {
-				summary = "Superseded by newer run"
-			}
-			_, err := h.gh.UpdateCheckRun(ctx, earlier.InstallationID, repo.Owner, repo.Name, earlier.CheckRunID, github.UpdateCheckRunRequest{
-				Status:      "completed",
-				Conclusion:  "cancelled",
-				CompletedAt: now.Format(time.RFC3339),
-				DetailsURL:  devicefarm.ConsoleURL(earlier.RunARN),
-				Output: &github.CheckRunOutput{
-					Title:   "Superseded",
-					Summary: summary,
-				},
-			})
-			if err != nil {
-				return fmt.Errorf("mark superseded check run %d cancelled: %w", earlier.CheckRunID, err)
-			}
-		}
-		if err := h.store.MarkSuperseded(ctx, earlier.RunARN, now); err != nil {
-			if errors.Is(err, store.ErrStateConflict) {
-				continue
-			}
-			return err
-		}
 	}
-	return nil
 }
 
 // findNewerActiveRun returns the newest ACTIVE run on the branch that is strictly

@@ -90,7 +90,7 @@ func TestStoreQueriesAndTransitions(t *testing.T) {
 	}
 
 	fake.updateErr = &types.ConditionalCheckFailedException{Message: aws.String("conflict")}
-	err = st.MarkSuperseded(context.Background(), "arn:aws:devicefarm:us-west-2:1:run:p/1", time.Now())
+	err = st.MarkCompleted(context.Background(), "arn:aws:devicefarm:us-west-2:1:run:p/1", "PASSED", time.Now())
 	if !errors.Is(err, ErrStateConflict) {
 		t.Fatalf("expected ErrStateConflict, got %v", err)
 	}
