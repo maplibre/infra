@@ -18,6 +18,26 @@ import (
 // ErrRunNotFound indicates a Device Farm run ARN does not exist.
 var ErrRunNotFound = errors.New("device farm run not found")
 
+// ErrUploadRejected indicates Device Farm permanently rejected an uploaded file.
+var ErrUploadRejected = errors.New("device farm rejected upload")
+
+// UploadRejectedError carries the upload name and Device Farm's rejection message.
+type UploadRejectedError struct {
+	Name    string
+	Message string
+}
+
+func (e *UploadRejectedError) Error() string {
+	if e.Message != "" {
+		return fmt.Sprintf("device farm rejected upload %s: %s", e.Name, e.Message)
+	}
+	return fmt.Sprintf("device farm rejected upload %s", e.Name)
+}
+
+func (e *UploadRejectedError) Unwrap() error {
+	return ErrUploadRejected
+}
+
 // API is the subset of AWS Device Farm SDK operations used by Client.
 type API interface {
 	CreateUpload(ctx context.Context, params *devicefarm.CreateUploadInput, optFns ...func(*devicefarm.Options)) (*devicefarm.CreateUploadOutput, error)
@@ -125,7 +145,7 @@ func (c *Client) UploadFile(ctx context.Context, projectARN, name string, upload
 			if msg == "" {
 				msg = aws.ToString(out.Upload.Metadata)
 			}
-			return "", fmt.Errorf("device farm rejected upload %s: %s", name, msg)
+			return "", &UploadRejectedError{Name: name, Message: msg}
 		}
 
 		select {

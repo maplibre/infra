@@ -25,6 +25,9 @@ const (
 // the record is no longer in the expected state.
 var ErrStateConflict = errors.New("run record state conflict")
 
+// ErrAlreadyClaimed is returned when another invocation already claimed a workflow run attempt.
+var ErrAlreadyClaimed = errors.New("workflow run attempt already claimed")
+
 // DynamoAPI is the subset of the AWS DynamoDB client used by Store.
 type DynamoAPI interface {
 	PutItem(ctx context.Context, params *dynamodb.PutItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error)
@@ -43,6 +46,34 @@ type Store struct {
 // New creates a Store backed by tableName.
 func New(client DynamoAPI, tableName string) *Store {
 	return &Store{client: client, tableName: tableName}
+}
+
+// ClaimWorkflowRun atomically claims a (repo, workflow_run_id, run_attempt) key in DynamoDB
+// with a 30-day TTL so concurrent or duplicate SQS deliveries cannot schedule duplicate runs.
+func (s *Store) ClaimWorkflowRun(ctx context.Context, claimKey string, now time.Time) error {
+	nowUTC := now.UTC()
+	av, err := attributevalue.MarshalMap(model.RunRecord{
+		RunARN:    claimKey,
+		State:     model.StateClaimed,
+		CreatedAt: nowUTC.Format(time.RFC3339Nano),
+		ExpiresAt: nowUTC.Add(RecordTTL).Unix(),
+	})
+	if err != nil {
+		return fmt.Errorf("marshal claim record: %w", err)
+	}
+	_, err = s.client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName:           aws.String(s.tableName),
+		Item:                av,
+		ConditionExpression: aws.String("attribute_not_exists(run_arn)"),
+	})
+	if err != nil {
+		var condErr *types.ConditionalCheckFailedException
+		if errors.As(err, &condErr) {
+			return ErrAlreadyClaimed
+		}
+		return fmt.Errorf("claim %s: %w", claimKey, err)
+	}
+	return nil
 }
 
 // PutRun writes or overwrites a RunRecord.

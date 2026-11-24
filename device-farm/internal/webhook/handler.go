@@ -61,6 +61,7 @@ type webhookEnvelope struct {
 	WorkflowJob *struct {
 		ID           int64  `json:"id"`
 		RunID        int64  `json:"run_id"`
+		RunAttempt   int    `json:"run_attempt"`
 		WorkflowName string `json:"workflow_name"`
 		HeadBranch   string `json:"head_branch"`
 		HeadSHA      string `json:"head_sha"`
@@ -69,6 +70,7 @@ type webhookEnvelope struct {
 	} `json:"workflow_job"`
 	WorkflowRun *struct {
 		ID             int64  `json:"id"`
+		RunAttempt     int    `json:"run_attempt"`
 		Name           string `json:"name"`
 		HeadBranch     string `json:"head_branch"`
 		HeadSHA        string `json:"head_sha"`
@@ -165,9 +167,7 @@ func (h *Handler) buildMessage(eventName, deliveryID string, repoCfg config.Repo
 		if env.WorkflowJob == nil {
 			return model.JobMessage{}, false, "missing workflow_job"
 		}
-		switch env.Action {
-		case "queued", "in_progress", "completed":
-		default:
+		if env.Action != "completed" {
 			return model.JobMessage{}, false, "unhandled action"
 		}
 		if env.WorkflowJob.Name != repoCfg.TriggerJob {
@@ -180,17 +180,18 @@ func (h *Handler) buildMessage(eventName, deliveryID string, repoCfg config.Repo
 			return model.JobMessage{}, false, "branch not allowed"
 		}
 		return model.JobMessage{
-			Event:          model.EventWorkflowJob,
-			Action:         env.Action,
-			DeliveryID:     deliveryID,
-			Repo:           repoCfg.FullName,
-			InstallationID: env.Installation.ID,
-			HeadSHA:        env.WorkflowJob.HeadSHA,
-			HeadBranch:     env.WorkflowJob.HeadBranch,
-			WorkflowRunID:  env.WorkflowJob.RunID,
-			WorkflowJobID:  env.WorkflowJob.ID,
-			JobName:        env.WorkflowJob.Name,
-			JobConclusion:  env.WorkflowJob.Conclusion,
+			Event:              model.EventWorkflowJob,
+			Action:             env.Action,
+			DeliveryID:         deliveryID,
+			Repo:               repoCfg.FullName,
+			InstallationID:     env.Installation.ID,
+			HeadSHA:            env.WorkflowJob.HeadSHA,
+			HeadBranch:         env.WorkflowJob.HeadBranch,
+			WorkflowRunID:      env.WorkflowJob.RunID,
+			WorkflowRunAttempt: env.WorkflowJob.RunAttempt,
+			WorkflowJobID:      env.WorkflowJob.ID,
+			JobName:            env.WorkflowJob.Name,
+			JobConclusion:      env.WorkflowJob.Conclusion,
 		}, true, ""
 
 	case string(model.EventWorkflowRun):
@@ -207,16 +208,17 @@ func (h *Handler) buildMessage(eventName, deliveryID string, repoCfg config.Repo
 			return model.JobMessage{}, false, "branch not allowed"
 		}
 		return model.JobMessage{
-			Event:          model.EventWorkflowRun,
-			Action:         env.Action,
-			DeliveryID:     deliveryID,
-			Repo:           repoCfg.FullName,
-			InstallationID: env.Installation.ID,
-			HeadSHA:        env.WorkflowRun.HeadSHA,
-			HeadBranch:     env.WorkflowRun.HeadBranch,
-			HeadRepo:       env.WorkflowRun.HeadRepository.FullName,
-			WorkflowRunID:  env.WorkflowRun.ID,
-			RunConclusion:  env.WorkflowRun.Conclusion,
+			Event:              model.EventWorkflowRun,
+			Action:             env.Action,
+			DeliveryID:         deliveryID,
+			Repo:               repoCfg.FullName,
+			InstallationID:     env.Installation.ID,
+			HeadSHA:            env.WorkflowRun.HeadSHA,
+			HeadBranch:         env.WorkflowRun.HeadBranch,
+			HeadRepo:           env.WorkflowRun.HeadRepository.FullName,
+			WorkflowRunID:      env.WorkflowRun.ID,
+			WorkflowRunAttempt: env.WorkflowRun.RunAttempt,
+			RunConclusion:      env.WorkflowRun.Conclusion,
 		}, true, ""
 
 	case string(model.EventCheckRun):

@@ -2,6 +2,7 @@ package devicefarm
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,7 @@ import (
 type fakeDeviceFarmAPI struct {
 	uploadURL      string
 	getUploadCalls int
+	rejectMessage  string
 	lastScheduleIn *devicefarm.ScheduleRunInput
 }
 
@@ -32,6 +34,14 @@ func (f *fakeDeviceFarmAPI) CreateUpload(_ context.Context, _ *devicefarm.Create
 
 func (f *fakeDeviceFarmAPI) GetUpload(_ context.Context, _ *devicefarm.GetUploadInput, _ ...func(*devicefarm.Options)) (*devicefarm.GetUploadOutput, error) {
 	f.getUploadCalls++
+	if f.rejectMessage != "" {
+		return &devicefarm.GetUploadOutput{
+			Upload: &types.Upload{
+				Status:  types.UploadStatusFailed,
+				Message: aws.String(f.rejectMessage),
+			},
+		}, nil
+	}
 	status := types.UploadStatusProcessing
 	if f.getUploadCalls >= 2 {
 		status = types.UploadStatusSucceeded
@@ -135,5 +145,36 @@ func TestUploadFileAndScheduleRun(t *testing.T) {
 	}
 	if aws.ToInt32(fake.lastScheduleIn.DeviceSelectionConfiguration.MaxDevices) != 2 {
 		t.Fatal("expected MaxDevices=2")
+	}
+}
+
+func TestUploadFileReturnsTypedRejectionError(t *testing.T) {
+	s3Server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer s3Server.Close()
+
+	fake := &fakeDeviceFarmAPI{
+		uploadURL:     s3Server.URL + "/presigned",
+		rejectMessage: "invalid zip archive",
+	}
+	client := NewClient(fake)
+	client.pollInterval = time.Millisecond
+
+	tmpFile := filepath.Join(t.TempDir(), "android-tests.zip")
+	if err := os.WriteFile(tmpFile, []byte("not-a-zip"), 0o600); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
+
+	_, err := client.UploadFile(context.Background(), "arn:proj", "android-tests.zip", types.UploadTypeAppiumWebNodeTestPackage, tmpFile)
+	if !errors.Is(err, ErrUploadRejected) {
+		t.Fatalf("expected ErrUploadRejected, got %v", err)
+	}
+	var rejected *UploadRejectedError
+	if !errors.As(err, &rejected) {
+		t.Fatalf("expected *UploadRejectedError, got %T", err)
+	}
+	if rejected.Name != "android-tests.zip" || rejected.Message != "invalid zip archive" {
+		t.Fatalf("unexpected rejected error: %+v", rejected)
 	}
 }

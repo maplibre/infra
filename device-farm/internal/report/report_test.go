@@ -138,7 +138,7 @@ func TestBuildCheckOutputAndTruncation(t *testing.T) {
 	if !strings.Contains(out.Text, "10 of 10 tests passed.") {
 		t.Fatalf("Text missing pass count:\n%s", out.Text)
 	}
-	if !strings.Contains(out.Text, "The tests didn't run:") || !strings.Contains(out.Text, "````\nadb: device offline") {
+	if !strings.Contains(out.Text, "The tests didn't run:") || !strings.Contains(out.Text, "~~~\nadb: device offline") {
 		t.Fatalf("Text missing fenced fallback output:\n%s", out.Text)
 	}
 
@@ -149,6 +149,29 @@ func TestBuildCheckOutputAndTruncation(t *testing.T) {
 	}
 	if !strings.Contains(truncated, "truncated") {
 		t.Fatal("expected truncation notice")
+	}
+}
+
+func TestBuildCheckOutputHugeBacktickRun(t *testing.T) {
+	hugeBackticks := strings.Repeat("`", 100_000)
+	out := BuildCheckOutput(types.ExecutionResultFailed, "", []PhoneReport{
+		{
+			PhoneName: "Google Pixel 9",
+			PhoneSlug: "Google-Pixel-9",
+			Result:    "FAILED",
+			JUnit: &JUnitSummary{
+				TotalTests:  1,
+				PassedTests: 0,
+				FailedTests: []string{"pkg::mod " + hugeBackticks},
+			},
+		},
+	})
+
+	if len(out.Text) > MaxGitHubCheckOutputLen {
+		t.Fatalf("Text length %d exceeds limit %d", len(out.Text), MaxGitHubCheckOutputLen)
+	}
+	if !strings.Contains(out.Text, "\n~~~\n") {
+		t.Fatalf("expected short ~~~ fence for huge backtick run, got prefix: %q", out.Text[:min(200, len(out.Text))])
 	}
 }
 

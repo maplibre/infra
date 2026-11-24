@@ -87,14 +87,16 @@ type CheckRun struct {
 
 // WorkflowRun represents a GitHub Actions workflow run.
 type WorkflowRun struct {
-	ID             int64  `json:"id"`
-	Name           string `json:"name"`
-	HeadBranch     string `json:"head_branch"`
-	HeadSHA        string `json:"head_sha"`
-	Event          string `json:"event"`
-	Status         string `json:"status"`
-	Conclusion     string `json:"conclusion"`
-	HTMLURL        string `json:"html_url"`
+	ID             int64     `json:"id"`
+	RunAttempt     int       `json:"run_attempt"`
+	Name           string    `json:"name"`
+	HeadBranch     string    `json:"head_branch"`
+	HeadSHA        string    `json:"head_sha"`
+	Event          string    `json:"event"`
+	Status         string    `json:"status"`
+	Conclusion     string    `json:"conclusion"`
+	CreatedAt      time.Time `json:"created_at"`
+	HTMLURL        string    `json:"html_url"`
 	HeadRepository struct {
 		FullName string `json:"full_name"`
 	} `json:"head_repository"`

@@ -9,7 +9,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"strconv"
 	"sync"
 	"time"
 
@@ -40,8 +39,8 @@ type GitHubAPI interface {
 
 // StoreAPI is the subset of DynamoDB store operations needed by worker.
 type StoreAPI interface {
+	ClaimWorkflowRun(ctx context.Context, claimKey string, now time.Time) error
 	PutRun(ctx context.Context, rec model.RunRecord) error
-	GetRun(ctx context.Context, runARN string) (model.RunRecord, bool, error)
 	DeleteRun(ctx context.Context, runARN string) error
 	QueryActiveByBranchKey(ctx context.Context, branchKey string) ([]model.RunRecord, error)
 	QueryByRepoSHA(ctx context.Context, repo, sha string) ([]model.RunRecord, error)
@@ -122,139 +121,66 @@ func (h *Handler) processRecord(ctx context.Context, rec events.SQSMessage) erro
 }
 
 func (h *Handler) handleWorkflowJob(ctx context.Context, repo config.RepoConfig, msg model.JobMessage) error {
+	if msg.Action != "completed" {
+		return nil
+	}
 	if msg.HeadBranch != "" && !h.cfg.BranchAllowed(msg.HeadBranch) {
 		return nil
 	}
 
-	pendingKey := model.PendingRunKey(repo.FullName, msg.WorkflowRunID)
-	existing, hasPending, err := h.store.GetRun(ctx, pendingKey)
-	if err != nil {
+	if msg.JobConclusion == "success" {
+		return h.scheduleDeviceFarmRun(ctx, repo, msg, false)
+	}
+
+	extID := model.ExternalID(msg.WorkflowRunID, msg.WorkflowRunAttempt)
+	if settled, _, err := h.findCheckRunForExternalID(ctx, repo, msg.InstallationID, msg.HeadSHA, extID); err != nil {
+		return err
+	} else if settled {
+		return nil
+	}
+
+	switch msg.JobConclusion {
+	case "skipped":
+		_, err := h.completeCheckRun(ctx, repo, msg.InstallationID, msg.HeadSHA, extID, 0,
+			"success", "Not needed", "Not needed: the plan left the Android tests out")
+		return err
+	case "cancelled":
+		_, err := h.completeCheckRun(ctx, repo, msg.InstallationID, msg.HeadSHA, extID, 0,
+			"cancelled", "Cancelled", "CI couldn't build the Android test package.")
+		return err
+	default:
+		// failure, timed_out, action_required, stale, etc.
+		_, err := h.completeCheckRun(ctx, repo, msg.InstallationID, msg.HeadSHA, extID, 0,
+			"failure", "Build failed", "CI couldn't build the Android test package.")
 		return err
 	}
-
-	switch msg.Action {
-	case "queued", "in_progress":
-		// Ignore stale queued/in_progress messages if this workflow run has already moved on.
-		if hasPending && existing.State != model.StatePending {
-			return nil
-		}
-		if hasPending && existing.CheckStatus == "in_progress" && msg.Action == "queued" {
-			return nil
-		}
-		alreadyScheduled, err := h.hasScheduledRun(ctx, repo.FullName, msg.HeadSHA, msg.WorkflowRunID)
-		if err != nil {
-			return err
-		}
-		if alreadyScheduled {
-			return nil
-		}
-
-		title := "Queued"
-		summary := "Waiting for CI to build the Android test package."
-		if msg.Action == "in_progress" {
-			title = "Building test package"
-			summary = "CI is building the Android test package."
-		}
-
-		checkRunID, err := h.upsertProgressCheckRun(ctx, repo, msg.InstallationID, msg.HeadSHA, msg.WorkflowRunID, existing.CheckRunID, msg.Action, "", title, summary)
-		if err != nil {
-			return err
-		}
-
-		now := h.now().UTC()
-		createdAt := existing.CreatedAt
-		if createdAt == "" {
-			createdAt = now.Format(time.RFC3339Nano)
-		}
-		return h.store.PutRun(ctx, model.RunRecord{
-			RunARN:         pendingKey,
-			State:          model.StatePending,
-			CreatedAt:      createdAt,
-			BranchKey:      model.BranchKey(repo.FullName, msg.HeadRepo, msg.HeadBranch),
-			RepoSHA:        model.RepoSHAKey(repo.FullName, msg.HeadSHA),
-			Repo:           repo.FullName,
-			SHA:            msg.HeadSHA,
-			HeadBranch:     msg.HeadBranch,
-			HeadRepo:       msg.HeadRepo,
-			CheckRunID:     checkRunID,
-			CheckStatus:    msg.Action,
-			WorkflowRunID:  msg.WorkflowRunID,
-			InstallationID: msg.InstallationID,
-			ExpiresAt:      now.Add(store.RecordTTL).Unix(),
-		})
-
-	case "completed":
-		checkRunID := existing.CheckRunID
-		if checkRunID == 0 {
-			checkRunID, err = h.findOpenCheckRunID(ctx, repo, msg.InstallationID, msg.HeadSHA, msg.WorkflowRunID)
-			if err != nil {
-				return err
-			}
-		}
-
-		switch msg.JobConclusion {
-		case "skipped":
-			checkRunID, err = h.completeCheckRun(ctx, repo, msg.InstallationID, msg.HeadSHA, msg.WorkflowRunID, checkRunID,
-				"success", "Not needed", "Not needed: the plan left the Android tests out")
-			if err != nil {
-				return err
-			}
-			return h.saveTerminalPending(ctx, repo, msg, checkRunID, model.StateSkipped, "SKIPPED")
-
-		case "cancelled":
-			checkRunID, err = h.completeCheckRun(ctx, repo, msg.InstallationID, msg.HeadSHA, msg.WorkflowRunID, checkRunID,
-				"cancelled", "Cancelled", "CI couldn't build the Android test package.")
-			if err != nil {
-				return err
-			}
-			return h.saveTerminalPending(ctx, repo, msg, checkRunID, model.StateBuildFailed, "CANCELLED")
-
-		case "success":
-			return h.scheduleDeviceFarmRun(ctx, repo, msg, checkRunID, false)
-
-		default:
-			// failure, timed_out, action_required, stale, etc.
-			checkRunID, err = h.completeCheckRun(ctx, repo, msg.InstallationID, msg.HeadSHA, msg.WorkflowRunID, checkRunID,
-				"failure", "Build failed", "CI couldn't build the Android test package.")
-			if err != nil {
-				return err
-			}
-			return h.saveTerminalPending(ctx, repo, msg, checkRunID, model.StateBuildFailed, msg.JobConclusion)
-		}
-	}
-
-	return nil
 }
 
 func (h *Handler) handleWorkflowRun(ctx context.Context, repo config.RepoConfig, msg model.JobMessage) error {
+	if msg.Action != "completed" {
+		return nil
+	}
 	if msg.HeadBranch != "" && !h.cfg.BranchAllowed(msg.HeadBranch) {
 		return nil
 	}
 
-	checkRuns, err := h.gh.ListCheckRunsForRef(ctx, msg.InstallationID, repo.Owner, repo.Name, msg.HeadSHA, repo.CheckName)
+	attempt := normalizeAttempt(msg.WorkflowRunAttempt)
+	extID := model.ExternalID(msg.WorkflowRunID, attempt)
+
+	settled, existingOpenID, err := h.findCheckRunForExternalID(ctx, repo, msg.InstallationID, msg.HeadSHA, extID)
 	if err != nil {
 		return err
 	}
-
-	var existingOpenID int64
-	for _, cr := range checkRuns {
-		if cr.Name != repo.CheckName {
-			continue
-		}
-		if cr.Status == "completed" {
-			return nil
-		}
-		if existingOpenID == 0 {
-			existingOpenID = cr.ID
-		}
+	if settled {
+		return nil
 	}
 
-	// If Device Farm is already running (or finished) for this workflow run, do nothing.
-	alreadyScheduled, err := h.hasScheduledRun(ctx, repo.FullName, msg.HeadSHA, msg.WorkflowRunID)
+	// If Device Farm already has an active or completed run for this exact attempt, do nothing.
+	alreadyRan, err := h.hasRunForAttempt(ctx, repo.FullName, msg.HeadSHA, msg.WorkflowRunID, attempt)
 	if err != nil {
 		return err
 	}
-	if alreadyScheduled {
+	if alreadyRan {
 		return nil
 	}
 
@@ -274,15 +200,15 @@ func (h *Handler) handleWorkflowRun(ctx context.Context, repo config.RepoConfig,
 	if triggerJob == nil {
 		switch msg.RunConclusion {
 		case "cancelled":
-			_, err = h.completeCheckRun(ctx, repo, msg.InstallationID, msg.HeadSHA, msg.WorkflowRunID, existingOpenID,
+			_, err = h.completeCheckRun(ctx, repo, msg.InstallationID, msg.HeadSHA, extID, existingOpenID,
 				"cancelled", "Cancelled", "CI workflow was cancelled before building the Android test package.")
 			return err
 		case "failure", "timed_out":
-			_, err = h.completeCheckRun(ctx, repo, msg.InstallationID, msg.HeadSHA, msg.WorkflowRunID, existingOpenID,
+			_, err = h.completeCheckRun(ctx, repo, msg.InstallationID, msg.HeadSHA, extID, existingOpenID,
 				"failure", "CI failed", "CI failed before building the Android test package.")
 			return err
 		default:
-			_, err = h.completeCheckRun(ctx, repo, msg.InstallationID, msg.HeadSHA, msg.WorkflowRunID, existingOpenID,
+			_, err = h.completeCheckRun(ctx, repo, msg.InstallationID, msg.HeadSHA, extID, existingOpenID,
 				"success", "Not needed", "Not needed: the plan left the Android tests out")
 			return err
 		}
@@ -290,18 +216,20 @@ func (h *Handler) handleWorkflowRun(ctx context.Context, repo config.RepoConfig,
 
 	switch triggerJob.Conclusion {
 	case "skipped":
-		_, err = h.completeCheckRun(ctx, repo, msg.InstallationID, msg.HeadSHA, msg.WorkflowRunID, existingOpenID,
+		_, err = h.completeCheckRun(ctx, repo, msg.InstallationID, msg.HeadSHA, extID, existingOpenID,
 			"success", "Not needed", "Not needed: the plan left the Android tests out")
 		return err
 	case "cancelled":
-		_, err = h.completeCheckRun(ctx, repo, msg.InstallationID, msg.HeadSHA, msg.WorkflowRunID, existingOpenID,
+		_, err = h.completeCheckRun(ctx, repo, msg.InstallationID, msg.HeadSHA, extID, existingOpenID,
 			"cancelled", "Cancelled", "CI couldn't build the Android test package.")
 		return err
 	case "success":
 		// Safety net recovery if the workflow_job completed webhook was dropped.
-		return h.scheduleDeviceFarmRun(ctx, repo, msg, existingOpenID, false)
+		// scheduleDeviceFarmRun atomically claims (repo, runID, attempt), so if
+		// workflow_job already scheduled it, this becomes a no-op.
+		return h.scheduleDeviceFarmRun(ctx, repo, msg, false)
 	default:
-		_, err = h.completeCheckRun(ctx, repo, msg.InstallationID, msg.HeadSHA, msg.WorkflowRunID, existingOpenID,
+		_, err = h.completeCheckRun(ctx, repo, msg.InstallationID, msg.HeadSHA, extID, existingOpenID,
 			"failure", "Build failed", "CI couldn't build the Android test package.")
 		return err
 	}
@@ -328,49 +256,46 @@ func (h *Handler) handleCheckRunRerequested(ctx context.Context, repo config.Rep
 	}
 
 	var workflowRunID int64
+	var runAttempt int
 	if matched != nil {
 		workflowRunID = matched.WorkflowRunID
+		runAttempt = matched.WorkflowRunAttempt
 		if msg.HeadBranch == "" {
 			msg.HeadBranch = matched.HeadBranch
 		}
 		if msg.HeadRepo == "" {
 			msg.HeadRepo = matched.HeadRepo
 		}
-	} else if msg.ExternalID != "" {
-		if parsed, err := strconv.ParseInt(msg.ExternalID, 10, 64); err == nil && parsed > 0 {
-			workflowRunID = parsed
-		}
+	} else if parsedID, parsedAttempt, ok := model.ParseExternalID(msg.ExternalID); ok {
+		workflowRunID = parsedID
+		runAttempt = parsedAttempt
 	}
 
 	if workflowRunID == 0 {
-		_, err := h.completeCheckRun(ctx, repo, msg.InstallationID, msg.HeadSHA, 0, 0,
+		_, err := h.completeCheckRun(ctx, repo, msg.InstallationID, msg.HeadSHA, "", 0,
 			"failure", "Unable to re-run",
 			"No CI workflow run record was found for this commit (records expire after 30 days). Re-run the CI workflow to rebuild the Android test package.")
 		return err
 	}
 
 	msg.WorkflowRunID = workflowRunID
-	// Create a new Check Run for the re-run so previous run history is preserved.
-	return h.scheduleDeviceFarmRun(ctx, repo, msg, 0, true)
+	msg.WorkflowRunAttempt = runAttempt
+	return h.scheduleDeviceFarmRun(ctx, repo, msg, true)
 }
 
-func (h *Handler) scheduleDeviceFarmRun(ctx context.Context, repo config.RepoConfig, msg model.JobMessage, existingCheckRunID int64, isRerun bool) error {
-	if !isRerun {
-		alreadyScheduled, err := h.hasScheduledRun(ctx, repo.FullName, msg.HeadSHA, msg.WorkflowRunID)
-		if err != nil {
-			return err
-		}
-		if alreadyScheduled {
-			h.logger.Info("skipping duplicate schedule for workflow run", "repo", repo.FullName, "workflow_run_id", msg.WorkflowRunID)
-			return nil
-		}
-	}
-
-	// Fetch authoritative workflow_run metadata to learn head_repository (critical for fork PRs).
+func (h *Handler) scheduleDeviceFarmRun(ctx context.Context, repo config.RepoConfig, msg model.JobMessage, isRerun bool) error {
+	// Fetch authoritative workflow_run metadata first to resolve head_repository,
+	// run_attempt, and created_at before claiming or superseding anything.
 	wfRun, err := h.gh.GetWorkflowRun(ctx, msg.InstallationID, repo.Owner, repo.Name, msg.WorkflowRunID)
 	if err != nil {
 		return fmt.Errorf("get workflow run %d: %w", msg.WorkflowRunID, err)
 	}
+
+	runAttempt := msg.WorkflowRunAttempt
+	if runAttempt <= 0 {
+		runAttempt = wfRun.RunAttempt
+	}
+	runAttempt = normalizeAttempt(runAttempt)
 
 	headBranch := msg.HeadBranch
 	if wfRun.HeadBranch != "" {
@@ -391,20 +316,89 @@ func (h *Handler) scheduleDeviceFarmRun(ctx context.Context, repo config.RepoCon
 	if headRepo == "" {
 		headRepo = repo.FullName
 	}
+	workflowCreatedAt := wfRun.CreatedAt.UTC()
+	extID := model.ExternalID(msg.WorkflowRunID, runAttempt)
 
-	checkRunID, err := h.upsertProgressCheckRun(ctx, repo, msg.InstallationID, headSHA, msg.WorkflowRunID, existingCheckRunID,
+	// Atomically claim (repo, workflowRunID, runAttempt) before creating checks,
+	// superseding runs, or uploading packages so concurrent/duplicate SQS deliveries
+	// cannot double-schedule the same workflow attempt.
+	claimKey := model.ClaimKey(repo.FullName, msg.WorkflowRunID, runAttempt)
+	claimed := false
+	if !isRerun {
+		if err := h.store.ClaimWorkflowRun(ctx, claimKey, h.now().UTC()); err != nil {
+			if errors.Is(err, store.ErrAlreadyClaimed) {
+				h.logger.Info("skipping duplicate schedule; workflow attempt already claimed",
+					"repo", repo.FullName, "workflow_run_id", msg.WorkflowRunID, "run_attempt", runAttempt)
+				return nil
+			}
+			return err
+		}
+		claimed = true
+	}
+
+	releaseClaim := func() {
+		if !claimed {
+			return
+		}
+		if delErr := h.store.DeleteRun(ctx, claimKey); delErr != nil {
+			h.logger.Warn("failed to release scheduling claim after transient error", "claim_key", claimKey, "err", delErr)
+		}
+		claimed = false
+	}
+
+	// Check active runs on the same branch before creating checks or stopping anything.
+	branchKey := model.BranchKey(repo.FullName, headRepo, headBranch)
+	var activeOnBranch []model.RunRecord
+	if branchKey != "" {
+		activeOnBranch, err = h.store.QueryActiveByBranchKey(ctx, branchKey)
+		if err != nil {
+			releaseClaim()
+			return err
+		}
+	}
+
+	// If a newer workflow run is already ACTIVE on this branch, this incoming workflow
+	// is stale: do NOT supersede the newer run; cancel this stale commit's check instead.
+	if !isRerun {
+		if newer := findNewerActiveRun(activeOnBranch, workflowCreatedAt, msg.WorkflowRunID); newer != nil {
+			_, err := h.completeCheckRun(ctx, repo, msg.InstallationID, headSHA, extID, 0,
+				"cancelled", "Superseded",
+				fmt.Sprintf("Superseded by newer commit %s", shortSHA(newer.SHA)))
+			if err != nil {
+				releaseClaim()
+				return err
+			}
+			h.logger.Info("skipped scheduling stale workflow run",
+				"repo", repo.FullName, "sha", headSHA, "newer_run_arn", newer.RunARN)
+			return nil
+		}
+	}
+
+	// On SQS retry after a transient failure, reuse any open Check Run for this attempt.
+	var existingCheckRunID int64
+	if !isRerun {
+		_, existingCheckRunID, err = h.findCheckRunForExternalID(ctx, repo, msg.InstallationID, headSHA, extID)
+		if err != nil {
+			releaseClaim()
+			return err
+		}
+	}
+
+	checkRunID, err := h.upsertProgressCheckRun(ctx, repo, msg.InstallationID, headSHA, extID, existingCheckRunID,
 		"in_progress", "", "Scheduling", "Scheduling on AWS Device Farm...")
 	if err != nil {
+		releaseClaim()
 		return err
 	}
 
-	branchKey := model.BranchKey(repo.FullName, headRepo, headBranch)
-	if err := h.supersedeActiveRuns(ctx, repo, branchKey, headSHA); err != nil {
+	if err := h.supersedeActiveRuns(ctx, repo, activeOnBranch, headSHA, workflowCreatedAt, msg.WorkflowRunID, isRerun); err != nil {
+		releaseClaim()
 		return err
 	}
 
 	artifacts, err := h.gh.ListWorkflowRunArtifacts(ctx, msg.InstallationID, repo.Owner, repo.Name, msg.WorkflowRunID, repo.ArtifactName)
 	if err != nil {
+		releaseClaim()
 		return err
 	}
 
@@ -419,14 +413,19 @@ func (h *Handler) scheduleDeviceFarmRun(ctx context.Context, repo config.RepoCon
 		}
 	}
 	if chosen == nil {
-		_, err := h.completeCheckRun(ctx, repo, msg.InstallationID, headSHA, msg.WorkflowRunID, checkRunID,
+		_, err := h.completeCheckRun(ctx, repo, msg.InstallationID, headSHA, extID, checkRunID,
 			"failure", "Artifact expired",
 			fmt.Sprintf("The CI artifact `%s` for this commit is missing or expired. Re-run the CI workflow to rebuild the Android test package.", repo.ArtifactName))
-		return err
+		if err != nil {
+			releaseClaim()
+			return err
+		}
+		return nil
 	}
 
 	tmpDir, err := os.MkdirTemp("", "device-farm-worker-*")
 	if err != nil {
+		releaseClaim()
 		return err
 	}
 	defer os.RemoveAll(tmpDir)
@@ -434,11 +433,16 @@ func (h *Handler) scheduleDeviceFarmRun(ctx context.Context, repo config.RepoCon
 	outerZipPath := filepath.Join(tmpDir, "artifact.zip")
 	if err := h.gh.DownloadArtifact(ctx, msg.InstallationID, repo.Owner, repo.Name, chosen.ID, outerZipPath, maxArtifactZipBytes); err != nil {
 		if errors.Is(err, github.ErrArtifactExpired) {
-			_, checkErr := h.completeCheckRun(ctx, repo, msg.InstallationID, headSHA, msg.WorkflowRunID, checkRunID,
+			_, checkErr := h.completeCheckRun(ctx, repo, msg.InstallationID, headSHA, extID, checkRunID,
 				"failure", "Artifact expired",
 				fmt.Sprintf("The CI artifact `%s` for this commit has expired. Re-run the CI workflow to rebuild the Android test package.", repo.ArtifactName))
-			return checkErr
+			if checkErr != nil {
+				releaseClaim()
+				return checkErr
+			}
+			return nil
 		}
+		releaseClaim()
 		return err
 	}
 
@@ -446,11 +450,16 @@ func (h *Handler) scheduleDeviceFarmRun(ctx context.Context, repo config.RepoCon
 	pkgPath := filepath.Join(tmpDir, repo.PackageFilename)
 	if err := report.ExtractPackageFromArtifactZip(outerZipPath, repo.PackageFilename, pkgPath, maxArtifactZipBytes); err != nil {
 		if errors.Is(err, report.ErrPackageNotFound) {
-			_, checkErr := h.completeCheckRun(ctx, repo, msg.InstallationID, headSHA, msg.WorkflowRunID, checkRunID,
+			_, checkErr := h.completeCheckRun(ctx, repo, msg.InstallationID, headSHA, extID, checkRunID,
 				"failure", "Invalid artifact",
 				fmt.Sprintf("The CI artifact `%s` did not contain `%s`.", repo.ArtifactName, repo.PackageFilename))
-			return checkErr
+			if checkErr != nil {
+				releaseClaim()
+				return checkErr
+			}
+			return nil
 		}
+		releaseClaim()
 		return err
 	}
 	// Free outer zip space in /tmp before uploading.
@@ -459,11 +468,13 @@ func (h *Handler) scheduleDeviceFarmRun(ctx context.Context, repo config.RepoCon
 	// Always fetch the Device Farm test spec from the default branch (main), NEVER from PR branch.
 	specBytes, err := h.gh.GetRawFile(ctx, msg.InstallationID, repo.Owner, repo.Name, repo.TestSpecPath, repo.DefaultBranch)
 	if err != nil {
+		releaseClaim()
 		return fmt.Errorf("fetch test spec %s@%s: %w", repo.TestSpecPath, repo.DefaultBranch, err)
 	}
 	specFilename := path.Base(repo.TestSpecPath)
 	specPath := filepath.Join(tmpDir, specFilename)
 	if err := os.WriteFile(specPath, specBytes, 0o600); err != nil {
+		releaseClaim()
 		return err
 	}
 
@@ -483,11 +494,21 @@ func (h *Handler) scheduleDeviceFarmRun(ctx context.Context, repo config.RepoCon
 		pkgARN, pkgErr = h.df.UploadFile(ctx, repo.ProjectARN, repo.PackageFilename, dftypes.UploadTypeAppiumWebNodeTestPackage, pkgPath)
 	}()
 	wg.Wait()
-	if specErr != nil {
-		return specErr
-	}
-	if pkgErr != nil {
-		return pkgErr
+
+	if uploadErr := firstError(specErr, pkgErr); uploadErr != nil {
+		var rejected *devicefarm.UploadRejectedError
+		if errors.As(uploadErr, &rejected) {
+			summary := rejected.Error()
+			_, checkErr := h.completeCheckRun(ctx, repo, msg.InstallationID, headSHA, extID, checkRunID,
+				"failure", "Device Farm rejected upload", summary)
+			if checkErr != nil {
+				releaseClaim()
+				return checkErr
+			}
+			return nil
+		}
+		releaseClaim()
+		return uploadErr
 	}
 
 	runName := fmt.Sprintf("%s %s %s", repo.Name, shortSHA(headSHA), headBranch)
@@ -500,59 +521,66 @@ func (h *Handler) scheduleDeviceFarmRun(ctx context.Context, repo config.RepoCon
 		JobTimeoutMinutes: repo.JobTimeoutMinutes,
 	})
 	if err != nil {
+		releaseClaim()
 		return err
 	}
 
 	now := h.now().UTC()
+	wfCreatedStr := ""
+	if !workflowCreatedAt.IsZero() {
+		wfCreatedStr = workflowCreatedAt.Format(time.RFC3339)
+	}
 	rec := model.RunRecord{
-		RunARN:         runARN,
-		State:          model.StateActive,
-		CreatedAt:      now.Format(time.RFC3339Nano),
-		BranchKey:      branchKey,
-		RepoSHA:        model.RepoSHAKey(repo.FullName, headSHA),
-		Repo:           repo.FullName,
-		SHA:            headSHA,
-		HeadBranch:     headBranch,
-		HeadRepo:       headRepo,
-		CheckRunID:     checkRunID,
-		WorkflowRunID:  msg.WorkflowRunID,
-		InstallationID: msg.InstallationID,
-		ExpiresAt:      now.Add(store.RecordTTL).Unix(),
+		RunARN:             runARN,
+		State:              model.StateActive,
+		CreatedAt:          now.Format(time.RFC3339Nano),
+		BranchKey:          branchKey,
+		RepoSHA:            model.RepoSHAKey(repo.FullName, headSHA),
+		Repo:               repo.FullName,
+		SHA:                headSHA,
+		HeadBranch:         headBranch,
+		HeadRepo:           headRepo,
+		CheckRunID:         checkRunID,
+		WorkflowRunID:      msg.WorkflowRunID,
+		WorkflowRunAttempt: runAttempt,
+		WorkflowCreatedAt:  wfCreatedStr,
+		InstallationID:     msg.InstallationID,
+		ExpiresAt:          now.Add(store.RecordTTL).Unix(),
 	}
 	if err := h.store.PutRun(ctx, rec); err != nil {
+		// Stop orphaned Device Farm run and release claim so SQS can cleanly retry.
+		if stopErr := h.df.StopRun(ctx, runARN); stopErr != nil {
+			h.logger.Warn("failed to stop orphaned Device Farm run after PutRun failure", "run_arn", runARN, "err", stopErr)
+		}
+		releaseClaim()
 		return err
 	}
 
-	// Clean up temporary pending tracking item once the real Device Farm run record is persisted.
-	if err := h.store.DeleteRun(ctx, model.PendingRunKey(repo.FullName, msg.WorkflowRunID)); err != nil {
-		h.logger.Warn("failed to delete pending run tracking record", "err", err)
-	}
+	// Keep the claim permanently now that the run is scheduled and persisted.
+	claimed = false
 
 	consoleURL := devicefarm.ConsoleURL(runARN)
 	summary := "Running Android tests on AWS Device Farm."
 	if consoleURL != "" {
 		summary += fmt.Sprintf("\n\n[View run in AWS Device Farm console](%s)", consoleURL)
 	}
-	if _, err := h.upsertProgressCheckRun(ctx, repo, msg.InstallationID, headSHA, msg.WorkflowRunID, checkRunID,
+	if _, err := h.upsertProgressCheckRun(ctx, repo, msg.InstallationID, headSHA, extID, checkRunID,
 		"in_progress", consoleURL, "Running on AWS Device Farm", summary); err != nil {
 		h.logger.Warn("failed to update check run with console URL after scheduling", "run_arn", runARN, "err", err)
 	}
 
-	h.logger.Info("scheduled device farm run", "repo", repo.FullName, "sha", headSHA, "run_arn", runARN, "check_run_id", checkRunID)
+	h.logger.Info("scheduled device farm run",
+		"repo", repo.FullName, "sha", headSHA, "run_arn", runARN, "check_run_id", checkRunID, "run_attempt", runAttempt)
 	return nil
 }
 
-func (h *Handler) supersedeActiveRuns(ctx context.Context, repo config.RepoConfig, branchKey, newSHA string) error {
-	if branchKey == "" {
-		return nil
-	}
-	active, err := h.store.QueryActiveByBranchKey(ctx, branchKey)
-	if err != nil {
-		return err
-	}
+func (h *Handler) supersedeActiveRuns(ctx context.Context, repo config.RepoConfig, active []model.RunRecord, newSHA string, incomingCreatedAt time.Time, incomingRunID int64, isRerun bool) error {
 	now := h.now().UTC()
 	for _, earlier := range active {
 		if !model.IsDeviceFarmARN(earlier.RunARN) {
+			continue
+		}
+		if !isRerun && isNewerWorkflowRun(earlier, incomingCreatedAt, incomingRunID) {
 			continue
 		}
 		if err := h.store.MarkSuperseded(ctx, earlier.RunARN, now); err != nil {
@@ -565,6 +593,10 @@ func (h *Handler) supersedeActiveRuns(ctx context.Context, repo config.RepoConfi
 			h.logger.Warn("failed to stop superseded Device Farm run", "run_arn", earlier.RunARN, "err", err)
 		}
 		if earlier.CheckRunID > 0 && earlier.InstallationID > 0 {
+			summary := fmt.Sprintf("Superseded by newer commit %s", shortSHA(newSHA))
+			if earlier.SHA == newSHA {
+				summary = "Superseded by newer run"
+			}
 			_, err := h.gh.UpdateCheckRun(ctx, earlier.InstallationID, repo.Owner, repo.Name, earlier.CheckRunID, github.UpdateCheckRunRequest{
 				Status:      "completed",
 				Conclusion:  "cancelled",
@@ -572,7 +604,7 @@ func (h *Handler) supersedeActiveRuns(ctx context.Context, repo config.RepoConfi
 				DetailsURL:  devicefarm.ConsoleURL(earlier.RunARN),
 				Output: &github.CheckRunOutput{
 					Title:   "Superseded",
-					Summary: fmt.Sprintf("Superseded by newer commit %s", shortSHA(newSHA)),
+					Summary: summary,
 				},
 			})
 			if err != nil {
@@ -583,7 +615,52 @@ func (h *Handler) supersedeActiveRuns(ctx context.Context, repo config.RepoConfi
 	return nil
 }
 
-func (h *Handler) hasScheduledRun(ctx context.Context, repoFullName, sha string, workflowRunID int64) (bool, error) {
+// findNewerActiveRun returns the newest ACTIVE run on the branch that is strictly
+// newer than (incomingCreatedAt, incomingRunID), or nil if none is newer.
+func findNewerActiveRun(active []model.RunRecord, incomingCreatedAt time.Time, incomingRunID int64) *model.RunRecord {
+	var newest *model.RunRecord
+	for i := range active {
+		r := &active[i]
+		if !model.IsDeviceFarmARN(r.RunARN) {
+			continue
+		}
+		if !isNewerWorkflowRun(*r, incomingCreatedAt, incomingRunID) {
+			continue
+		}
+		if newest == nil {
+			newest = r
+			continue
+		}
+		// Pick the newest among newer runs for the cancellation message.
+		nTime, _ := time.Parse(time.RFC3339Nano, newest.WorkflowCreatedAt)
+		if isNewerWorkflowRun(*r, nTime, newest.WorkflowRunID) {
+			newest = r
+		}
+	}
+	return newest
+}
+
+// isNewerWorkflowRun reports whether existing represents a strictly newer workflow
+// run than (incomingCreatedAt, incomingRunID).
+func isNewerWorkflowRun(existing model.RunRecord, incomingCreatedAt time.Time, incomingRunID int64) bool {
+	if existing.WorkflowCreatedAt != "" && !incomingCreatedAt.IsZero() {
+		if existingTime, err := time.Parse(time.RFC3339Nano, existing.WorkflowCreatedAt); err == nil {
+			if existingTime.After(incomingCreatedAt) {
+				return true
+			}
+			if existingTime.Before(incomingCreatedAt) {
+				return false
+			}
+			return existing.WorkflowRunID > incomingRunID
+		}
+	}
+	if existing.WorkflowRunID > 0 && incomingRunID > 0 {
+		return existing.WorkflowRunID > incomingRunID
+	}
+	return false
+}
+
+func (h *Handler) hasRunForAttempt(ctx context.Context, repoFullName, sha string, workflowRunID int64, runAttempt int) (bool, error) {
 	if workflowRunID == 0 || sha == "" {
 		return false, nil
 	}
@@ -591,41 +668,46 @@ func (h *Handler) hasScheduledRun(ctx context.Context, repoFullName, sha string,
 	if err != nil {
 		return false, err
 	}
+	wantAttempt := normalizeAttempt(runAttempt)
 	for _, r := range records {
-		if r.WorkflowRunID == workflowRunID && model.IsDeviceFarmARN(r.RunARN) &&
-			(r.State == model.StateActive || r.State == model.StateCompleted) {
+		if !model.IsDeviceFarmARN(r.RunARN) {
+			continue
+		}
+		if r.WorkflowRunID != workflowRunID || normalizeAttempt(r.WorkflowRunAttempt) != wantAttempt {
+			continue
+		}
+		if r.State == model.StateActive || r.State == model.StateCompleted {
 			return true, nil
 		}
 	}
 	return false, nil
 }
 
-func (h *Handler) findOpenCheckRunID(ctx context.Context, repo config.RepoConfig, installationID int64, sha string, workflowRunID int64) (int64, error) {
+// findCheckRunForExternalID checks whether a Check Run for repo.CheckName with
+// matching external_id is already completed, or returns the ID of an open one.
+func (h *Handler) findCheckRunForExternalID(ctx context.Context, repo config.RepoConfig, installationID int64, sha, extID string) (completed bool, openID int64, err error) {
+	if extID == "" || sha == "" {
+		return false, 0, nil
+	}
 	runs, err := h.gh.ListCheckRunsForRef(ctx, installationID, repo.Owner, repo.Name, sha, repo.CheckName)
 	if err != nil {
-		return 0, err
+		return false, 0, err
 	}
-	extID := strconv.FormatInt(workflowRunID, 10)
-	var fallback int64
 	for _, cr := range runs {
-		if cr.Name != repo.CheckName || cr.Status == "completed" {
+		if cr.Name != repo.CheckName || cr.ExternalID != extID {
 			continue
 		}
-		if cr.ExternalID == extID {
-			return cr.ID, nil
+		if cr.Status == "completed" {
+			return true, 0, nil
 		}
-		if fallback == 0 {
-			fallback = cr.ID
+		if openID == 0 {
+			openID = cr.ID
 		}
 	}
-	return fallback, nil
+	return false, openID, nil
 }
 
-func (h *Handler) upsertProgressCheckRun(ctx context.Context, repo config.RepoConfig, installationID int64, headSHA string, workflowRunID, existingID int64, status, detailsURL, title, summary string) (int64, error) {
-	extID := ""
-	if workflowRunID > 0 {
-		extID = strconv.FormatInt(workflowRunID, 10)
-	}
+func (h *Handler) upsertProgressCheckRun(ctx context.Context, repo config.RepoConfig, installationID int64, headSHA, extID string, existingID int64, status, detailsURL, title, summary string) (int64, error) {
 	out := &github.CheckRunOutput{Title: title, Summary: summary}
 	if existingID > 0 {
 		cr, err := h.gh.UpdateCheckRun(ctx, installationID, repo.Owner, repo.Name, existingID, github.UpdateCheckRunRequest{
@@ -654,12 +736,8 @@ func (h *Handler) upsertProgressCheckRun(ctx context.Context, repo config.RepoCo
 	return cr.ID, nil
 }
 
-func (h *Handler) completeCheckRun(ctx context.Context, repo config.RepoConfig, installationID int64, headSHA string, workflowRunID, existingID int64, conclusion, title, summary string) (int64, error) {
+func (h *Handler) completeCheckRun(ctx context.Context, repo config.RepoConfig, installationID int64, headSHA, extID string, existingID int64, conclusion, title, summary string) (int64, error) {
 	now := h.now().UTC().Format(time.RFC3339)
-	extID := ""
-	if workflowRunID > 0 {
-		extID = strconv.FormatInt(workflowRunID, 10)
-	}
 	out := &github.CheckRunOutput{Title: title, Summary: summary}
 	if existingID > 0 {
 		cr, err := h.gh.UpdateCheckRun(ctx, installationID, repo.Owner, repo.Name, existingID, github.UpdateCheckRunRequest{
@@ -690,25 +768,20 @@ func (h *Handler) completeCheckRun(ctx context.Context, repo config.RepoConfig, 
 	return cr.ID, nil
 }
 
-func (h *Handler) saveTerminalPending(ctx context.Context, repo config.RepoConfig, msg model.JobMessage, checkRunID int64, state model.RunState, result string) error {
-	now := h.now().UTC()
-	return h.store.PutRun(ctx, model.RunRecord{
-		RunARN:         model.PendingRunKey(repo.FullName, msg.WorkflowRunID),
-		State:          state,
-		CreatedAt:      now.Format(time.RFC3339Nano),
-		CompletedAt:    now.Format(time.RFC3339Nano),
-		BranchKey:      model.BranchKey(repo.FullName, msg.HeadRepo, msg.HeadBranch),
-		RepoSHA:        model.RepoSHAKey(repo.FullName, msg.HeadSHA),
-		Repo:           repo.FullName,
-		SHA:            msg.HeadSHA,
-		HeadBranch:     msg.HeadBranch,
-		HeadRepo:       msg.HeadRepo,
-		CheckRunID:     checkRunID,
-		WorkflowRunID:  msg.WorkflowRunID,
-		InstallationID: msg.InstallationID,
-		Result:         result,
-		ExpiresAt:      now.Add(store.RecordTTL).Unix(),
-	})
+func normalizeAttempt(attempt int) int {
+	if attempt <= 0 {
+		return 1
+	}
+	return attempt
+}
+
+func firstError(errs ...error) error {
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func shortSHA(sha string) string {

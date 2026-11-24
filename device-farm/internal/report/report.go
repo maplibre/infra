@@ -386,13 +386,44 @@ func sanitizeInline(s string) string {
 	return s
 }
 
-// writeFencedBlock chooses a fence longer than any run of backticks in content
-// so untrusted test output cannot break out of the Markdown code block.
+// writeFencedBlock bounds content and chooses the shorter safe fence (` or ~)
+// in a single O(N) pass so untrusted test output cannot break out of the code
+// block or trigger superlinear scanning.
 func writeFencedBlock(b *strings.Builder, content string) {
-	fence := "```"
-	for strings.Contains(content, fence) {
-		fence += "`"
+	content = TruncateMarkdown(content, MaxGitHubCheckOutputLen)
+
+	var maxBackticks, maxTildes int
+	var curBackticks, curTildes int
+	for i := 0; i < len(content); i++ {
+		switch content[i] {
+		case '`':
+			curBackticks++
+			if curBackticks > maxBackticks {
+				maxBackticks = curBackticks
+			}
+			curTildes = 0
+		case '~':
+			curTildes++
+			if curTildes > maxTildes {
+				maxTildes = curTildes
+			}
+			curBackticks = 0
+		default:
+			curBackticks = 0
+			curTildes = 0
+		}
 	}
+
+	backtickLen := max(3, maxBackticks+1)
+	tildeLen := max(3, maxTildes+1)
+
+	var fence string
+	if tildeLen < backtickLen {
+		fence = strings.Repeat("~", tildeLen)
+	} else {
+		fence = strings.Repeat("`", backtickLen)
+	}
+
 	b.WriteString(fence)
 	b.WriteByte('\n')
 	if content != "" {

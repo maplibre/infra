@@ -12,18 +12,20 @@ three modes selected by the `MODE` environment variable:
 
 1. **`webhook`** (`128 MB`, `10s` timeout, Lambda Function URL): validates
    `X-Hub-Signature-256` against the GitHub App webhook secret from Secrets Manager,
-   filters configured repositories and relevant events (`workflow_job`,
-   `workflow_run`, `check_run`), enqueues a compact JSON job onto SQS, and returns
-   `202 Accepted` in under a second.
+   filters configured repositories and relevant events (`workflow_job` `completed`,
+   `workflow_run` `completed`, `check_run` `rerequested`), enqueues a compact JSON
+   job onto SQS, and returns `202 Accepted` in under a second.
 2. **`worker`** (`1024 MB`, `2048 MB /tmp`, `300s` timeout, SQS trigger with
    `batch_size = 1` and `ReportBatchItemFailures`): authenticates as the GitHub App
-   installation, maintains the `device-test / android` Check Run lifecycle, stops and
-   supersedes earlier `ACTIVE` runs on the same `(repo, head_repo, head_branch)`,
-   downloads the `android-device-tests` Actions artifact without leaking the GitHub
-   `Authorization` header to Azure Blob Storage, extracts `android-tests.zip` without
-   unpacking or executing its contents, fetches `tools/device-farm/android.yml` from
-   `main` (never from a PR branch), uploads both to Device Farm, schedules the run,
-   and records it in DynamoDB.
+   installation, atomically claims `(repo, workflow_run_id, run_attempt)` in
+   DynamoDB so duplicate or concurrent deliveries cannot double-schedule, checks
+   workflow ordering so stale commits never supersede newer `ACTIVE` runs on the
+   same `(repo, head_repo, head_branch)`, downloads the `android-device-tests`
+   Actions artifact without leaking the GitHub `Authorization` header to Azure Blob
+   Storage, extracts `android-tests.zip` without unpacking or executing its
+   contents, fetches `tools/device-farm/android.yml` from `main` (never from a PR
+   branch), uploads both to Device Farm, schedules the run, and records it in
+   DynamoDB.
 3. **`poller`** (`512 MB`, `1024 MB /tmp`, `120s` timeout, EventBridge `rate(1 minute)`):
    queries DynamoDB `state-index` for `ACTIVE` runs (exiting immediately when idle),
    checks `devicefarm:GetRun`, downloads `TESTSPEC_OUTPUT` and `CUSTOMER_ARTIFACT`

@@ -101,7 +101,42 @@ func TestWebhookHandler(t *testing.T) {
 		}
 	})
 
-	t.Run("enqueues matching workflow_job and respects ALLOWED_BRANCHES", func(t *testing.T) {
+	t.Run("ignores workflow_job queued and in_progress", func(t *testing.T) {
+		q := &fakeSQS{}
+		h := NewHandler(testConfig(""), fakeCreds{secret: secret}, q, nil)
+
+		for _, action := range []string{"queued", "in_progress"} {
+			body := `{
+				"action": "` + action + `",
+				"repository": {"full_name": "maplibre/mln-rs"},
+				"installation": {"id": 555},
+				"workflow_job": {
+					"id": 100,
+					"run_id": 200,
+					"run_attempt": 1,
+					"workflow_name": "ci",
+					"head_branch": "main",
+					"head_sha": "abc123",
+					"name": "prepare-device-tests"
+				}
+			}`
+			resp, err := h.Handle(context.Background(), events.LambdaFunctionURLRequest{
+				Headers: map[string]string{
+					"x-github-event":      "workflow_job",
+					"x-hub-signature-256": sign(secret, body),
+				},
+				Body: body,
+			})
+			if err != nil {
+				t.Fatalf("%s Handle() error = %v", action, err)
+			}
+			if resp.StatusCode != http.StatusOK || len(q.messages) != 0 {
+				t.Fatalf("%s expected 200 ignored, got status=%d messages=%d", action, resp.StatusCode, len(q.messages))
+			}
+		}
+	})
+
+	t.Run("enqueues completed workflow_job with run_attempt and respects ALLOWED_BRANCHES", func(t *testing.T) {
 		q := &fakeSQS{}
 		h := NewHandler(testConfig("ci/device-farm-lambda"), fakeCreds{secret: secret}, q, nil)
 
@@ -112,6 +147,7 @@ func TestWebhookHandler(t *testing.T) {
 			"workflow_job": {
 				"id": 100,
 				"run_id": 200,
+				"run_attempt": 3,
 				"workflow_name": "ci",
 				"head_branch": "ci/device-farm-lambda",
 				"head_sha": "abc123",
@@ -140,7 +176,7 @@ func TestWebhookHandler(t *testing.T) {
 		if err := json.Unmarshal([]byte(q.messages[0]), &msg); err != nil {
 			t.Fatalf("unmarshal SQS message: %v", err)
 		}
-		if msg.Event != model.EventWorkflowJob || msg.WorkflowRunID != 200 || msg.JobConclusion != "success" {
+		if msg.Event != model.EventWorkflowJob || msg.WorkflowRunID != 200 || msg.WorkflowRunAttempt != 3 || msg.JobConclusion != "success" {
 			t.Fatalf("unexpected msg: %+v", msg)
 		}
 
@@ -152,6 +188,7 @@ func TestWebhookHandler(t *testing.T) {
 			"workflow_job": {
 				"id": 101,
 				"run_id": 201,
+				"run_attempt": 1,
 				"workflow_name": "ci",
 				"head_branch": "other-branch",
 				"head_sha": "def456",
@@ -174,7 +211,7 @@ func TestWebhookHandler(t *testing.T) {
 		}
 	})
 
-	t.Run("enqueues check_run rerequested and workflow_run completed", func(t *testing.T) {
+	t.Run("enqueues check_run rerequested and workflow_run completed with run_attempt", func(t *testing.T) {
 		q := &fakeSQS{}
 		h := NewHandler(testConfig(""), fakeCreds{secret: secret}, q, nil)
 
@@ -190,6 +227,7 @@ func TestWebhookHandler(t *testing.T) {
 					"installation": {"id": 555},
 					"workflow_run": {
 						"id": 300,
+						"run_attempt": 2,
 						"name": "ci",
 						"head_branch": "main",
 						"head_sha": "111",
@@ -208,7 +246,7 @@ func TestWebhookHandler(t *testing.T) {
 						"id": 400,
 						"name": "device-test / android",
 						"head_sha": "111",
-						"external_id": "300",
+						"external_id": "300:2",
 						"check_suite": {"head_branch": "main"}
 					}
 				}`,
@@ -230,6 +268,13 @@ func TestWebhookHandler(t *testing.T) {
 		}
 		if len(q.messages) != 2 {
 			t.Fatalf("expected 2 SQS messages, got %d", len(q.messages))
+		}
+		var wfMsg model.JobMessage
+		if err := json.Unmarshal([]byte(q.messages[0]), &wfMsg); err != nil {
+			t.Fatal(err)
+		}
+		if wfMsg.WorkflowRunAttempt != 2 {
+			t.Fatalf("WorkflowRunAttempt = %d, want 2", wfMsg.WorkflowRunAttempt)
 		}
 	})
 }

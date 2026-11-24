@@ -15,14 +15,17 @@ import (
 )
 
 type fakeDynamoAPI struct {
+	lastPut    *dynamodb.PutItemInput
 	lastQuery  *dynamodb.QueryInput
 	lastUpdate *dynamodb.UpdateItemInput
 	queryPages [][]model.RunRecord
+	putErr     error
 	updateErr  error
 }
 
-func (f *fakeDynamoAPI) PutItem(_ context.Context, _ *dynamodb.PutItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error) {
-	return &dynamodb.PutItemOutput{}, nil
+func (f *fakeDynamoAPI) PutItem(_ context.Context, params *dynamodb.PutItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error) {
+	f.lastPut = params
+	return &dynamodb.PutItemOutput{}, f.putErr
 }
 
 func (f *fakeDynamoAPI) GetItem(_ context.Context, _ *dynamodb.GetItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
@@ -87,5 +90,30 @@ func TestStoreQueriesAndTransitions(t *testing.T) {
 	err = st.MarkSuperseded(context.Background(), "arn:aws:devicefarm:us-west-2:1:run:p/1", time.Now())
 	if !errors.Is(err, ErrStateConflict) {
 		t.Fatalf("expected ErrStateConflict, got %v", err)
+	}
+}
+
+func TestClaimWorkflowRun(t *testing.T) {
+	fake := &fakeDynamoAPI{}
+	st := New(fake, "runs-table")
+
+	key := model.ClaimKey("maplibre/mln-rs", 123, 2)
+	if err := st.ClaimWorkflowRun(context.Background(), key, time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("ClaimWorkflowRun() error = %v", err)
+	}
+	if aws.ToString(fake.lastPut.ConditionExpression) != "attribute_not_exists(run_arn)" {
+		t.Fatalf("ConditionExpression = %q, want attribute_not_exists(run_arn)", aws.ToString(fake.lastPut.ConditionExpression))
+	}
+	if _, hasBranch := fake.lastPut.Item["branch_key"]; hasBranch {
+		t.Fatal("claim item should omit branch_key")
+	}
+	if _, hasRepoSHA := fake.lastPut.Item["repo_sha"]; hasRepoSHA {
+		t.Fatal("claim item should omit repo_sha")
+	}
+
+	fake.putErr = &types.ConditionalCheckFailedException{Message: aws.String("exists")}
+	err := st.ClaimWorkflowRun(context.Background(), key, time.Now())
+	if !errors.Is(err, ErrAlreadyClaimed) {
+		t.Fatalf("expected ErrAlreadyClaimed, got %v", err)
 	}
 }
