@@ -242,13 +242,15 @@ export function tailLines(data: Buffer, n: number): string[] {
   return data.subarray(start, end).toString("utf8").replaceAll("\r\n", "\n").split("\n");
 }
 
-export function truncateMarkdown(s: string, maxLen = MAX_CHECK_OUTPUT_LEN): string {
-  if (s.length <= maxLen) return s;
+export function truncateMarkdown(s: string, maxBytes = MAX_CHECK_OUTPUT_LEN): string {
+  const buf = Buffer.from(s, "utf8");
+  if (buf.length <= maxBytes) return s;
   const suffix = "\n\n... (truncated; see full output in artifacts)\n";
-  let cut = maxLen - suffix.length;
-  if (cut <= 0) return s.slice(0, maxLen);
-  if (s.charCodeAt(cut - 1) >= 0xd800 && s.charCodeAt(cut - 1) <= 0xdbff) cut--;
-  return s.slice(0, cut) + suffix;
+  const withSuffix = maxBytes - Buffer.byteLength(suffix, "utf8");
+  let cut = withSuffix > 0 ? withSuffix : Math.max(0, maxBytes);
+  while (cut > 0 && (buf[cut]! & 0xc0) === 0x80) cut--;
+  const head = buf.subarray(0, cut).toString("utf8");
+  return withSuffix > 0 ? head + suffix : head;
 }
 
 function fencedBlock(raw: string): string {

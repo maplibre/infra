@@ -177,7 +177,12 @@ describe("tailLines & Markdown rendering", () => {
     assert.match(out.text, /\n~~~\nadb: offline/);
 
     const truncated = truncateMarkdown("a".repeat(MAX_CHECK_OUTPUT_LEN + 500));
-    assert.ok(truncated.length <= MAX_CHECK_OUTPUT_LEN);
+    assert.ok(Buffer.byteLength(truncated, "utf8") <= MAX_CHECK_OUTPUT_LEN);
     assert.match(truncated, /truncated/);
+
+    const cjk = truncateMarkdown("中".repeat(40_000));
+    assert.ok(Buffer.byteLength(cjk, "utf8") <= MAX_CHECK_OUTPUT_LEN);
+    assert.ok(!cjk.includes("\ufffd"));
+    assert.match(cjk, /truncated/);
   });
 });
