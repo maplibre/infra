@@ -2,6 +2,8 @@ package worker
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,7 +25,10 @@ import (
 	"github.com/maplibre/infra/device-farm/internal/store"
 )
 
-const maxArtifactZipBytes = 512 << 20 // 512 MiB
+const (
+	maxArtifactZipBytes = 512 << 20 // 512 MiB
+	cleanupTimeout      = 5 * time.Second
+)
 
 // GitHubAPI is the subset of the GitHub client needed by worker.
 type GitHubAPI interface {
@@ -39,9 +44,10 @@ type GitHubAPI interface {
 
 // StoreAPI is the subset of DynamoDB store operations needed by worker.
 type StoreAPI interface {
-	ClaimWorkflowRun(ctx context.Context, claimKey string, now time.Time) error
+	ClaimWorkflowRun(ctx context.Context, claimKey, owner string, now time.Time) error
+	CompleteWorkflowClaim(ctx context.Context, claimKey, owner string, now time.Time) error
+	ReleaseWorkflowClaim(ctx context.Context, claimKey, owner string) error
 	PutRun(ctx context.Context, rec model.RunRecord) error
-	DeleteRun(ctx context.Context, runARN string) error
 	QueryActiveByBranchKey(ctx context.Context, branchKey string) ([]model.RunRecord, error)
 	QueryByRepoSHA(ctx context.Context, repo, sha string) ([]model.RunRecord, error)
 	MarkSuperseded(ctx context.Context, runARN string, completedAt time.Time) error
@@ -236,45 +242,39 @@ func (h *Handler) handleWorkflowRun(ctx context.Context, repo config.RepoConfig,
 }
 
 func (h *Handler) handleCheckRunRerequested(ctx context.Context, repo config.RepoConfig, msg model.JobMessage) error {
-	records, err := h.store.QueryByRepoSHA(ctx, repo.FullName, msg.HeadSHA)
-	if err != nil {
-		return err
-	}
-
-	var matched *model.RunRecord
-	for i := range records {
-		if records[i].WorkflowRunID == 0 {
-			continue
-		}
-		if msg.CheckRunID != 0 && records[i].CheckRunID == msg.CheckRunID {
-			matched = &records[i]
-			break
-		}
-		if matched == nil {
-			matched = &records[i]
-		}
-	}
-
 	var workflowRunID int64
 	var runAttempt int
-	if matched != nil {
-		workflowRunID = matched.WorkflowRunID
-		runAttempt = matched.WorkflowRunAttempt
-		if msg.HeadBranch == "" {
-			msg.HeadBranch = matched.HeadBranch
-		}
-		if msg.HeadRepo == "" {
-			msg.HeadRepo = matched.HeadRepo
-		}
-	} else if parsedID, parsedAttempt, ok := model.ParseExternalID(msg.ExternalID); ok {
+
+	// Prefer the Check Run's own external_id ("<workflowRunID>:<runAttempt>").
+	if parsedID, parsedAttempt, ok := model.ParseExternalID(msg.ExternalID); ok {
 		workflowRunID = parsedID
 		runAttempt = parsedAttempt
+	} else if msg.CheckRunID != 0 {
+		// Fall back only to an exact CheckRunID match in DynamoDB; never hijack an
+		// unrelated workflow run on the same SHA.
+		records, err := h.store.QueryByRepoSHA(ctx, repo.FullName, msg.HeadSHA)
+		if err != nil {
+			return err
+		}
+		for i := range records {
+			if records[i].CheckRunID == msg.CheckRunID && records[i].WorkflowRunID > 0 {
+				workflowRunID = records[i].WorkflowRunID
+				runAttempt = records[i].WorkflowRunAttempt
+				if msg.HeadBranch == "" {
+					msg.HeadBranch = records[i].HeadBranch
+				}
+				if msg.HeadRepo == "" {
+					msg.HeadRepo = records[i].HeadRepo
+				}
+				break
+			}
+		}
 	}
 
 	if workflowRunID == 0 {
 		_, err := h.completeCheckRun(ctx, repo, msg.InstallationID, msg.HeadSHA, "", 0,
 			"failure", "Unable to re-run",
-			"No CI workflow run record was found for this commit (records expire after 30 days). Re-run the CI workflow to rebuild the Android test package.")
+			"No CI workflow run record was found for this check run (records expire after 30 days). Re-run the CI workflow to rebuild the Android test package.")
 		return err
 	}
 
@@ -319,13 +319,17 @@ func (h *Handler) scheduleDeviceFarmRun(ctx context.Context, repo config.RepoCon
 	workflowCreatedAt := wfRun.CreatedAt.UTC()
 	extID := model.ExternalID(msg.WorkflowRunID, runAttempt)
 
-	// Atomically claim (repo, workflowRunID, runAttempt) before creating checks,
-	// superseding runs, or uploading packages so concurrent/duplicate SQS deliveries
-	// cannot double-schedule the same workflow attempt.
+	// Acquire a recoverable ownership-scoped CLAIMING lease before creating checks,
+	// superseding runs, or uploading packages.
 	claimKey := model.ClaimKey(repo.FullName, msg.WorkflowRunID, runAttempt)
+	var claimOwner string
 	claimed := false
 	if !isRerun {
-		if err := h.store.ClaimWorkflowRun(ctx, claimKey, h.now().UTC()); err != nil {
+		claimOwner, err = newClaimOwner()
+		if err != nil {
+			return fmt.Errorf("generate claim owner: %w", err)
+		}
+		if err := h.store.ClaimWorkflowRun(ctx, claimKey, claimOwner, h.now().UTC()); err != nil {
 			if errors.Is(err, store.ErrAlreadyClaimed) {
 				h.logger.Info("skipping duplicate schedule; workflow attempt already claimed",
 					"repo", repo.FullName, "workflow_run_id", msg.WorkflowRunID, "run_attempt", runAttempt)
@@ -340,10 +344,40 @@ func (h *Handler) scheduleDeviceFarmRun(ctx context.Context, repo config.RepoCon
 		if !claimed {
 			return
 		}
-		if delErr := h.store.DeleteRun(ctx, claimKey); delErr != nil {
-			h.logger.Warn("failed to release scheduling claim after transient error", "claim_key", claimKey, "err", delErr)
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+		defer cancel()
+		if relErr := h.store.ReleaseWorkflowClaim(cleanupCtx, claimKey, claimOwner); relErr != nil {
+			h.logger.Warn("failed to release scheduling claim after transient error", "claim_key", claimKey, "err", relErr)
 		}
 		claimed = false
+	}
+
+	completeClaim := func() {
+		if !claimed {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+		defer cancel()
+		if compErr := h.store.CompleteWorkflowClaim(cleanupCtx, claimKey, claimOwner, h.now().UTC()); compErr != nil {
+			h.logger.Warn("failed to finalize workflow claim", "claim_key", claimKey, "err", compErr)
+		}
+		claimed = false
+	}
+
+	// Guard the rare crash window where a prior invocation persisted PutRun but
+	// crashed before CompleteWorkflowClaim and its lease expired.
+	if !isRerun {
+		alreadyExists, err := h.hasRunForAttempt(ctx, repo.FullName, headSHA, msg.WorkflowRunID, runAttempt)
+		if err != nil {
+			releaseClaim()
+			return err
+		}
+		if alreadyExists {
+			completeClaim()
+			h.logger.Info("skipping duplicate schedule after lease takeover; run already persisted",
+				"repo", repo.FullName, "workflow_run_id", msg.WorkflowRunID, "run_attempt", runAttempt)
+			return nil
+		}
 	}
 
 	// Check active runs on the same branch before creating checks or stopping anything.
@@ -368,6 +402,7 @@ func (h *Handler) scheduleDeviceFarmRun(ctx context.Context, repo config.RepoCon
 				releaseClaim()
 				return err
 			}
+			completeClaim()
 			h.logger.Info("skipped scheduling stale workflow run",
 				"repo", repo.FullName, "sha", headSHA, "newer_run_arn", newer.RunARN)
 			return nil
@@ -420,6 +455,7 @@ func (h *Handler) scheduleDeviceFarmRun(ctx context.Context, repo config.RepoCon
 			releaseClaim()
 			return err
 		}
+		completeClaim()
 		return nil
 	}
 
@@ -440,6 +476,7 @@ func (h *Handler) scheduleDeviceFarmRun(ctx context.Context, repo config.RepoCon
 				releaseClaim()
 				return checkErr
 			}
+			completeClaim()
 			return nil
 		}
 		releaseClaim()
@@ -457,6 +494,7 @@ func (h *Handler) scheduleDeviceFarmRun(ctx context.Context, repo config.RepoCon
 				releaseClaim()
 				return checkErr
 			}
+			completeClaim()
 			return nil
 		}
 		releaseClaim()
@@ -505,6 +543,7 @@ func (h *Handler) scheduleDeviceFarmRun(ctx context.Context, repo config.RepoCon
 				releaseClaim()
 				return checkErr
 			}
+			completeClaim()
 			return nil
 		}
 		releaseClaim()
@@ -548,16 +587,20 @@ func (h *Handler) scheduleDeviceFarmRun(ctx context.Context, repo config.RepoCon
 		ExpiresAt:          now.Add(store.RecordTTL).Unix(),
 	}
 	if err := h.store.PutRun(ctx, rec); err != nil {
-		// Stop orphaned Device Farm run and release claim so SQS can cleanly retry.
-		if stopErr := h.df.StopRun(ctx, runARN); stopErr != nil {
+		// Stop orphaned Device Farm run and release claim using detached contexts so
+		// cleanup still runs if ctx already timed out.
+		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+		if stopErr := h.df.StopRun(stopCtx, runARN); stopErr != nil {
 			h.logger.Warn("failed to stop orphaned Device Farm run after PutRun failure", "run_arn", runARN, "err", stopErr)
 		}
+		cancel()
 		releaseClaim()
 		return err
 	}
 
-	// Keep the claim permanently now that the run is scheduled and persisted.
-	claimed = false
+	// Finalize claim now that the ACTIVE record is persisted. Even if finalization
+	// fails transiently, the persisted record prevents double-scheduling on lease takeover.
+	completeClaim()
 
 	consoleURL := devicefarm.ConsoleURL(runARN)
 	summary := "Running Android tests on AWS Device Farm."
@@ -673,10 +716,7 @@ func (h *Handler) hasRunForAttempt(ctx context.Context, repoFullName, sha string
 		if !model.IsDeviceFarmARN(r.RunARN) {
 			continue
 		}
-		if r.WorkflowRunID != workflowRunID || normalizeAttempt(r.WorkflowRunAttempt) != wantAttempt {
-			continue
-		}
-		if r.State == model.StateActive || r.State == model.StateCompleted {
+		if r.WorkflowRunID == workflowRunID && normalizeAttempt(r.WorkflowRunAttempt) == wantAttempt {
 			return true, nil
 		}
 	}
@@ -766,6 +806,14 @@ func (h *Handler) completeCheckRun(ctx context.Context, repo config.RepoConfig, 
 		return 0, err
 	}
 	return cr.ID, nil
+}
+
+func newClaimOwner() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 func normalizeAttempt(attempt int) int {

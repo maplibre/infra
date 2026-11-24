@@ -23,17 +23,19 @@ import (
 )
 
 type fakeGH struct {
-	mu           sync.Mutex
-	nextCheckID  int64
-	created      []github.CreateCheckRunRequest
-	updated      map[int64][]github.UpdateCheckRunRequest
-	listedChecks []github.CheckRun
-	workflowRun  github.WorkflowRun
-	jobs         []github.WorkflowJob
-	artifacts    []github.Artifact
-	downloadErr  error
-	rawFileRef   string
-	rawFileBytes []byte
+	mu                sync.Mutex
+	nextCheckID       int64
+	created           []github.CreateCheckRunRequest
+	updated           map[int64][]github.UpdateCheckRunRequest
+	listedChecks      []github.CheckRun
+	workflowRun       github.WorkflowRun
+	jobs              []github.WorkflowJob
+	artifacts         []github.Artifact
+	downloadErr       error
+	onDownload        func()
+	rawFileRef        string
+	rawFileBytes      []byte
+	lastWorkflowRunID int64
 }
 
 func newFakeGH() *fakeGH {
@@ -85,9 +87,10 @@ func (f *fakeGH) ListCheckRunsForRef(_ context.Context, _ int64, _, _, _, _ stri
 	return out, nil
 }
 
-func (f *fakeGH) GetWorkflowRun(_ context.Context, _ int64, _, _ string, _ int64) (github.WorkflowRun, error) {
+func (f *fakeGH) GetWorkflowRun(_ context.Context, _ int64, _, _ string, runID int64) (github.WorkflowRun, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.lastWorkflowRunID = runID
 	return f.workflowRun, nil
 }
 
@@ -102,7 +105,11 @@ func (f *fakeGH) ListWorkflowRunArtifacts(_ context.Context, _ int64, _, _ strin
 func (f *fakeGH) DownloadArtifact(_ context.Context, _ int64, _, _ string, _ int64, dstPath string, _ int64) error {
 	f.mu.Lock()
 	err := f.downloadErr
+	hook := f.onDownload
 	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	if err != nil {
 		return err
 	}
@@ -128,39 +135,81 @@ func (f *fakeGH) GetRawFile(_ context.Context, _ int64, _, _, _, ref string) ([]
 }
 
 type fakeStore struct {
-	mu      sync.Mutex
-	records map[string]model.RunRecord
+	mu             sync.Mutex
+	records        map[string]model.RunRecord
+	putRunErr      error
+	onPutRun       func()
+	releaseCtxErrs []error
+	releaseCalls   int
+	completeCalls  int
 }
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{records: make(map[string]model.RunRecord)}
 }
 
-func (s *fakeStore) ClaimWorkflowRun(_ context.Context, claimKey string, now time.Time) error {
+func (s *fakeStore) ClaimWorkflowRun(_ context.Context, claimKey, owner string, now time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, exists := s.records[claimKey]; exists {
-		return store.ErrAlreadyClaimed
+	nowUTC := now.UTC()
+	if existing, exists := s.records[claimKey]; exists {
+		if existing.State != model.StateClaiming || existing.LeaseExpiresAt >= nowUTC.Unix() {
+			return store.ErrAlreadyClaimed
+		}
 	}
 	s.records[claimKey] = model.RunRecord{
-		RunARN:    claimKey,
-		State:     model.StateClaimed,
-		CreatedAt: now.UTC().Format(time.RFC3339Nano),
+		RunARN:         claimKey,
+		State:          model.StateClaiming,
+		ClaimOwner:     owner,
+		LeaseExpiresAt: nowUTC.Add(store.ClaimLeaseTTL).Unix(),
+		CreatedAt:      nowUTC.Format(time.RFC3339Nano),
+		ExpiresAt:      nowUTC.Add(store.RecordTTL).Unix(),
 	}
+	return nil
+}
+
+func (s *fakeStore) CompleteWorkflowClaim(_ context.Context, claimKey, owner string, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.completeCalls++
+	rec, exists := s.records[claimKey]
+	if !exists || rec.State != model.StateClaiming || rec.ClaimOwner != owner {
+		return store.ErrStateConflict
+	}
+	rec.State = model.StateClaimed
+	rec.LeaseExpiresAt = 0
+	rec.ExpiresAt = now.UTC().Add(store.RecordTTL).Unix()
+	s.records[claimKey] = rec
+	return nil
+}
+
+func (s *fakeStore) ReleaseWorkflowClaim(ctx context.Context, claimKey, owner string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.releaseCalls++
+	s.releaseCtxErrs = append(s.releaseCtxErrs, ctx.Err())
+	rec, exists := s.records[claimKey]
+	if !exists || rec.State != model.StateClaiming || rec.ClaimOwner != owner {
+		return nil
+	}
+	delete(s.records, claimKey)
 	return nil
 }
 
 func (s *fakeStore) PutRun(_ context.Context, rec model.RunRecord) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.records[rec.RunARN] = rec
-	return nil
-}
-
-func (s *fakeStore) DeleteRun(_ context.Context, arn string) error {
+	hook := s.onPutRun
+	err := s.putRunErr
+	s.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	if err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.records, arn)
+	s.records[rec.RunARN] = rec
 	return nil
 }
 
@@ -204,6 +253,7 @@ type fakeDF struct {
 	uploads     []dftypes.UploadType
 	uploadErr   error
 	stoppedARNs []string
+	stopCtxErrs []error
 	scheduledIn []devicefarm.ScheduleInput
 	runCounter  int
 	nextRunARN  string
@@ -230,10 +280,11 @@ func (d *fakeDF) ScheduleRun(_ context.Context, in devicefarm.ScheduleInput) (st
 	return fmt.Sprintf("arn:aws:devicefarm:us-west-2:373521797162:run:proj/run-%d", d.runCounter), nil
 }
 
-func (d *fakeDF) StopRun(_ context.Context, arn string) error {
+func (d *fakeDF) StopRun(ctx context.Context, arn string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.stoppedARNs = append(d.stoppedARNs, arn)
+	d.stopCtxErrs = append(d.stopCtxErrs, ctx.Err())
 	return nil
 }
 
@@ -584,10 +635,11 @@ func TestWorkerUploadRejectedSettlesCheckWithoutRetry(t *testing.T) {
 		t.Fatalf("expected permanent upload rejection not to retry, got err=%v failures=%v", err, resp.BatchItemFailures)
 	}
 
-	// Claim stays in place so duplicate deliveries don't retry permanently rejected package.
+	// Claim is finalized to CLAIMED so duplicate deliveries don't retry permanently rejected package.
 	claimKey := model.ClaimKey("maplibre/mln-rs", 950, 1)
-	if _, ok := st.records[claimKey]; !ok {
-		t.Fatal("expected claim to remain persisted on permanent upload rejection")
+	claimRec, ok := st.records[claimKey]
+	if !ok || claimRec.State != model.StateClaimed || claimRec.LeaseExpiresAt != 0 {
+		t.Fatalf("expected finalized CLAIMED record on permanent upload rejection, got %+v (exists=%v)", claimRec, ok)
 	}
 
 	updates := gh.updated[gh.nextCheckID]
@@ -598,6 +650,361 @@ func TestWorkerUploadRejectedSettlesCheckWithoutRetry(t *testing.T) {
 	if last.Status != "completed" || last.Conclusion != "failure" || last.Output.Title != "Device Farm rejected upload" || !strings.Contains(last.Output.Summary, "corrupted zip archive") {
 		t.Fatalf("unexpected final Check Run update: %+v", last)
 	}
+}
+
+func TestWorkerClaimLeaseTakeoverAndCrashDedup(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+
+	t.Run("expired CLAIMING lease allows retry takeover and finalizes to CLAIMED", func(t *testing.T) {
+		gh := newFakeGH()
+		gh.workflowRun = github.WorkflowRun{ID: 810, RunAttempt: 1, HeadBranch: "main", HeadSHA: "eee555", CreatedAt: now}
+		gh.workflowRun.HeadRepository.FullName = "maplibre/mln-rs"
+		gh.artifacts = []github.Artifact{{ID: 21, Name: "android-device-tests", CreatedAt: now}}
+
+		st := newFakeStore()
+		claimKey := model.ClaimKey("maplibre/mln-rs", 810, 1)
+		st.records[claimKey] = model.RunRecord{
+			RunARN:         claimKey,
+			State:          model.StateClaiming,
+			ClaimOwner:     "crashed-worker",
+			LeaseExpiresAt: now.Add(-10 * time.Second).Unix(),
+		}
+
+		df := &fakeDF{}
+		h := NewHandler(testWorkerCfg(), gh, st, df, nil)
+		h.now = func() time.Time { return now }
+
+		msg := model.JobMessage{
+			Event:              model.EventWorkflowJob,
+			Action:             "completed",
+			Repo:               "maplibre/mln-rs",
+			InstallationID:     99,
+			HeadSHA:            "eee555",
+			HeadBranch:         "main",
+			WorkflowRunID:      810,
+			WorkflowRunAttempt: 1,
+			JobConclusion:      "success",
+		}
+		resp, err := h.Handle(context.Background(), sqsEventOf(t, msg))
+		if err != nil || len(resp.BatchItemFailures) != 0 {
+			t.Fatalf("Handle() err=%v failures=%v", err, resp.BatchItemFailures)
+		}
+		if len(df.scheduledIn) != 1 {
+			t.Fatalf("scheduledIn = %d, want 1 after expired lease takeover", len(df.scheduledIn))
+		}
+		claimRec := st.records[claimKey]
+		if claimRec.State != model.StateClaimed || claimRec.LeaseExpiresAt != 0 || claimRec.ClaimOwner == "crashed-worker" {
+			t.Fatalf("expected finalized CLAIMED record with new owner, got %+v", claimRec)
+		}
+
+		// Subsequent delivery far in the future is permanently deduplicated by CLAIMED.
+		h.now = func() time.Time { return now.Add(24 * time.Hour) }
+		resp, err = h.Handle(context.Background(), sqsEventOf(t, msg))
+		if err != nil || len(resp.BatchItemFailures) != 0 {
+			t.Fatalf("duplicate Handle() err=%v failures=%v", err, resp.BatchItemFailures)
+		}
+		if len(df.scheduledIn) != 1 {
+			t.Fatalf("scheduledIn = %d, want 1 (CLAIMED must block duplicates)", len(df.scheduledIn))
+		}
+	})
+
+	t.Run("active unexpired CLAIMING lease rejects concurrent delivery", func(t *testing.T) {
+		gh := newFakeGH()
+		gh.workflowRun = github.WorkflowRun{ID: 811, RunAttempt: 1, HeadBranch: "main", HeadSHA: "fff666", CreatedAt: now}
+		gh.workflowRun.HeadRepository.FullName = "maplibre/mln-rs"
+		gh.artifacts = []github.Artifact{{ID: 22, Name: "android-device-tests", CreatedAt: now}}
+
+		st := newFakeStore()
+		claimKey := model.ClaimKey("maplibre/mln-rs", 811, 1)
+		st.records[claimKey] = model.RunRecord{
+			RunARN:         claimKey,
+			State:          model.StateClaiming,
+			ClaimOwner:     "active-worker",
+			LeaseExpiresAt: now.Add(60 * time.Second).Unix(),
+		}
+
+		df := &fakeDF{}
+		h := NewHandler(testWorkerCfg(), gh, st, df, nil)
+		h.now = func() time.Time { return now }
+
+		resp, err := h.Handle(context.Background(), sqsEventOf(t, model.JobMessage{
+			Event:              model.EventWorkflowJob,
+			Action:             "completed",
+			Repo:               "maplibre/mln-rs",
+			InstallationID:     99,
+			HeadSHA:            "fff666",
+			HeadBranch:         "main",
+			WorkflowRunID:      811,
+			WorkflowRunAttempt: 1,
+			JobConclusion:      "success",
+		}))
+		if err != nil || len(resp.BatchItemFailures) != 0 {
+			t.Fatalf("Handle() err=%v failures=%v", err, resp.BatchItemFailures)
+		}
+		if len(df.scheduledIn) != 0 {
+			t.Fatalf("expected 0 schedules while active CLAIMING lease is held, got %d", len(df.scheduledIn))
+		}
+	})
+
+	t.Run("crash after PutRun deduplicates on expired lease takeover", func(t *testing.T) {
+		gh := newFakeGH()
+		gh.workflowRun = github.WorkflowRun{ID: 812, RunAttempt: 1, HeadBranch: "main", HeadSHA: "123abc", CreatedAt: now}
+		gh.workflowRun.HeadRepository.FullName = "maplibre/mln-rs"
+		gh.artifacts = []github.Artifact{{ID: 23, Name: "android-device-tests", CreatedAt: now}}
+
+		st := newFakeStore()
+		claimKey := model.ClaimKey("maplibre/mln-rs", 812, 1)
+		st.records[claimKey] = model.RunRecord{
+			RunARN:         claimKey,
+			State:          model.StateClaiming,
+			ClaimOwner:     "crashed-after-putrun",
+			LeaseExpiresAt: now.Add(-5 * time.Second).Unix(),
+		}
+		existingARN := "arn:aws:devicefarm:us-west-2:373521797162:run:proj/already-persisted"
+		st.records[existingARN] = model.RunRecord{
+			RunARN:             existingARN,
+			State:              model.StateActive,
+			RepoSHA:            model.RepoSHAKey("maplibre/mln-rs", "123abc"),
+			Repo:               "maplibre/mln-rs",
+			SHA:                "123abc",
+			WorkflowRunID:      812,
+			WorkflowRunAttempt: 1,
+		}
+
+		df := &fakeDF{}
+		h := NewHandler(testWorkerCfg(), gh, st, df, nil)
+		h.now = func() time.Time { return now }
+
+		resp, err := h.Handle(context.Background(), sqsEventOf(t, model.JobMessage{
+			Event:              model.EventWorkflowJob,
+			Action:             "completed",
+			Repo:               "maplibre/mln-rs",
+			InstallationID:     99,
+			HeadSHA:            "123abc",
+			HeadBranch:         "main",
+			WorkflowRunID:      812,
+			WorkflowRunAttempt: 1,
+			JobConclusion:      "success",
+		}))
+		if err != nil || len(resp.BatchItemFailures) != 0 {
+			t.Fatalf("Handle() err=%v failures=%v", err, resp.BatchItemFailures)
+		}
+		if len(df.scheduledIn) != 0 {
+			t.Fatalf("expected 0 new runs when run already persisted before crash, got %d", len(df.scheduledIn))
+		}
+		if st.records[claimKey].State != model.StateClaimed {
+			t.Fatalf("expected claim to be finalized to CLAIMED on dedup takeover, got %s", st.records[claimKey].State)
+		}
+	})
+}
+
+func TestWorkerCleanupUsesDetachedContext(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+
+	t.Run("releases claim with non-canceled context after download timeout", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		gh := newFakeGH()
+		gh.workflowRun = github.WorkflowRun{ID: 820, RunAttempt: 1, HeadBranch: "main", HeadSHA: "aaa999", CreatedAt: now}
+		gh.workflowRun.HeadRepository.FullName = "maplibre/mln-rs"
+		gh.artifacts = []github.Artifact{{ID: 30, Name: "android-device-tests", CreatedAt: now}}
+		gh.onDownload = cancel
+		gh.downloadErr = context.Canceled
+
+		st := newFakeStore()
+		df := &fakeDF{}
+		h := NewHandler(testWorkerCfg(), gh, st, df, nil)
+
+		resp, err := h.Handle(ctx, sqsEventOf(t, model.JobMessage{
+			Event:              model.EventWorkflowJob,
+			Action:             "completed",
+			Repo:               "maplibre/mln-rs",
+			InstallationID:     99,
+			HeadSHA:            "aaa999",
+			HeadBranch:         "main",
+			WorkflowRunID:      820,
+			WorkflowRunAttempt: 1,
+			JobConclusion:      "success",
+		}))
+		if err != nil || len(resp.BatchItemFailures) != 1 {
+			t.Fatalf("expected 1 batch failure, got err=%v failures=%v", err, resp.BatchItemFailures)
+		}
+		if st.releaseCalls != 1 || st.releaseCtxErrs[0] != nil {
+			t.Fatalf("expected ReleaseWorkflowClaim with non-canceled ctx, got calls=%d ctxErrs=%v", st.releaseCalls, st.releaseCtxErrs)
+		}
+		if _, stillClaimed := st.records[model.ClaimKey("maplibre/mln-rs", 820, 1)]; stillClaimed {
+			t.Fatal("expected claim to be deleted after release")
+		}
+	})
+
+	t.Run("stops orphaned Device Farm run and releases claim with detached context after PutRun failure", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		gh := newFakeGH()
+		gh.workflowRun = github.WorkflowRun{ID: 821, RunAttempt: 1, HeadBranch: "main", HeadSHA: "bbb999", CreatedAt: now}
+		gh.workflowRun.HeadRepository.FullName = "maplibre/mln-rs"
+		gh.artifacts = []github.Artifact{{ID: 31, Name: "android-device-tests", CreatedAt: now}}
+
+		st := newFakeStore()
+		st.onPutRun = cancel
+		st.putRunErr = context.DeadlineExceeded
+		df := &fakeDF{nextRunARN: "arn:aws:devicefarm:us-west-2:373521797162:run:proj/orphan-run"}
+		h := NewHandler(testWorkerCfg(), gh, st, df, nil)
+
+		resp, err := h.Handle(ctx, sqsEventOf(t, model.JobMessage{
+			Event:              model.EventWorkflowJob,
+			Action:             "completed",
+			Repo:               "maplibre/mln-rs",
+			InstallationID:     99,
+			HeadSHA:            "bbb999",
+			HeadBranch:         "main",
+			WorkflowRunID:      821,
+			WorkflowRunAttempt: 1,
+			JobConclusion:      "success",
+		}))
+		if err != nil || len(resp.BatchItemFailures) != 1 {
+			t.Fatalf("expected 1 batch failure, got err=%v failures=%v", err, resp.BatchItemFailures)
+		}
+		if len(df.stoppedARNs) != 1 || df.stoppedARNs[0] != "arn:aws:devicefarm:us-west-2:373521797162:run:proj/orphan-run" {
+			t.Fatalf("expected orphaned run to be stopped, got %v", df.stoppedARNs)
+		}
+		if len(df.stopCtxErrs) != 1 || df.stopCtxErrs[0] != nil {
+			t.Fatalf("expected StopRun with non-canceled ctx, got %v", df.stopCtxErrs)
+		}
+		if st.releaseCalls != 1 || st.releaseCtxErrs[0] != nil {
+			t.Fatalf("expected ReleaseWorkflowClaim with non-canceled ctx, got calls=%d ctxErrs=%v", st.releaseCalls, st.releaseCtxErrs)
+		}
+	})
+}
+
+func TestWorkerCheckRunRerequestedMultiWorkflowSHA(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+
+	t.Run("prefers msg.ExternalID over unrelated DynamoDB record on same SHA", func(t *testing.T) {
+		gh := newFakeGH()
+		gh.workflowRun = github.WorkflowRun{ID: 701, RunAttempt: 2, HeadBranch: "main", HeadSHA: "shared-sha", CreatedAt: now}
+		gh.workflowRun.HeadRepository.FullName = "maplibre/mln-rs"
+		gh.artifacts = []github.Artifact{{ID: 40, Name: "android-device-tests", CreatedAt: now}}
+
+		st := newFakeStore()
+		st.records["arn:aws:devicefarm:us-west-2:373521797162:run:proj/other"] = model.RunRecord{
+			RunARN:             "arn:aws:devicefarm:us-west-2:373521797162:run:proj/other",
+			State:              model.StateCompleted,
+			RepoSHA:            model.RepoSHAKey("maplibre/mln-rs", "shared-sha"),
+			Repo:               "maplibre/mln-rs",
+			SHA:                "shared-sha",
+			CheckRunID:         999,
+			WorkflowRunID:      9999,
+			WorkflowRunAttempt: 1,
+		}
+		df := &fakeDF{}
+		h := NewHandler(testWorkerCfg(), gh, st, df, nil)
+
+		resp, err := h.Handle(context.Background(), sqsEventOf(t, model.JobMessage{
+			Event:          model.EventCheckRun,
+			Action:         "rerequested",
+			Repo:           "maplibre/mln-rs",
+			InstallationID: 99,
+			HeadSHA:        "shared-sha",
+			CheckRunID:     50,
+			ExternalID:     "701:2",
+		}))
+		if err != nil || len(resp.BatchItemFailures) != 0 {
+			t.Fatalf("Handle() err=%v failures=%v", err, resp.BatchItemFailures)
+		}
+		if gh.lastWorkflowRunID != 701 {
+			t.Fatalf("GetWorkflowRun called with %d, want 701 from ExternalID", gh.lastWorkflowRunID)
+		}
+		if len(df.scheduledIn) != 1 || len(gh.created) != 1 || gh.created[0].ExternalID != "701:2" {
+			t.Fatalf("expected 1 rerun scheduled for 701:2, got scheduled=%d created=%+v", len(df.scheduledIn), gh.created)
+		}
+	})
+
+	t.Run("does not fall back to unrelated CheckRunID on same SHA when ExternalID is empty", func(t *testing.T) {
+		gh := newFakeGH()
+		st := newFakeStore()
+		st.records["arn:aws:devicefarm:us-west-2:373521797162:run:proj/other"] = model.RunRecord{
+			RunARN:             "arn:aws:devicefarm:us-west-2:373521797162:run:proj/other",
+			State:              model.StateCompleted,
+			RepoSHA:            model.RepoSHAKey("maplibre/mln-rs", "shared-sha"),
+			Repo:               "maplibre/mln-rs",
+			SHA:                "shared-sha",
+			CheckRunID:         999,
+			WorkflowRunID:      9999,
+			WorkflowRunAttempt: 1,
+		}
+		df := &fakeDF{}
+		h := NewHandler(testWorkerCfg(), gh, st, df, nil)
+
+		resp, err := h.Handle(context.Background(), sqsEventOf(t, model.JobMessage{
+			Event:          model.EventCheckRun,
+			Action:         "rerequested",
+			Repo:           "maplibre/mln-rs",
+			InstallationID: 99,
+			HeadSHA:        "shared-sha",
+			CheckRunID:     50,
+		}))
+		if err != nil || len(resp.BatchItemFailures) != 0 {
+			t.Fatalf("Handle() err=%v failures=%v", err, resp.BatchItemFailures)
+		}
+		if len(df.scheduledIn) != 0 {
+			t.Fatalf("expected 0 runs scheduled when CheckRunID does not match, got %d", len(df.scheduledIn))
+		}
+		if len(gh.created) != 1 || gh.created[0].Conclusion != "failure" || gh.created[0].Output.Title != "Unable to re-run" {
+			t.Fatalf("expected Unable to re-run failure check run, got %+v", gh.created)
+		}
+	})
+
+	t.Run("falls back to exact CheckRunID match when ExternalID is empty", func(t *testing.T) {
+		gh := newFakeGH()
+		gh.workflowRun = github.WorkflowRun{ID: 702, RunAttempt: 1, HeadBranch: "main", HeadSHA: "shared-sha", CreatedAt: now}
+		gh.workflowRun.HeadRepository.FullName = "maplibre/mln-rs"
+		gh.artifacts = []github.Artifact{{ID: 41, Name: "android-device-tests", CreatedAt: now}}
+
+		st := newFakeStore()
+		st.records["arn:aws:devicefarm:us-west-2:373521797162:run:proj/other"] = model.RunRecord{
+			RunARN:             "arn:aws:devicefarm:us-west-2:373521797162:run:proj/other",
+			State:              model.StateCompleted,
+			RepoSHA:            model.RepoSHAKey("maplibre/mln-rs", "shared-sha"),
+			Repo:               "maplibre/mln-rs",
+			SHA:                "shared-sha",
+			CheckRunID:         999,
+			WorkflowRunID:      9999,
+			WorkflowRunAttempt: 1,
+		}
+		st.records["arn:aws:devicefarm:us-west-2:373521797162:run:proj/exact"] = model.RunRecord{
+			RunARN:             "arn:aws:devicefarm:us-west-2:373521797162:run:proj/exact",
+			State:              model.StateCompleted,
+			RepoSHA:            model.RepoSHAKey("maplibre/mln-rs", "shared-sha"),
+			Repo:               "maplibre/mln-rs",
+			SHA:                "shared-sha",
+			CheckRunID:         50,
+			WorkflowRunID:      702,
+			WorkflowRunAttempt: 1,
+		}
+		df := &fakeDF{}
+		h := NewHandler(testWorkerCfg(), gh, st, df, nil)
+
+		resp, err := h.Handle(context.Background(), sqsEventOf(t, model.JobMessage{
+			Event:          model.EventCheckRun,
+			Action:         "rerequested",
+			Repo:           "maplibre/mln-rs",
+			InstallationID: 99,
+			HeadSHA:        "shared-sha",
+			CheckRunID:     50,
+		}))
+		if err != nil || len(resp.BatchItemFailures) != 0 {
+			t.Fatalf("Handle() err=%v failures=%v", err, resp.BatchItemFailures)
+		}
+		if gh.lastWorkflowRunID != 702 {
+			t.Fatalf("GetWorkflowRun called with %d, want 702 from exact CheckRunID match", gh.lastWorkflowRunID)
+		}
+		if len(df.scheduledIn) != 1 {
+			t.Fatalf("expected 1 rerun scheduled, got %d", len(df.scheduledIn))
+		}
+	})
 }
 
 func TestWorkerSkippedJobAndSafetyNetAndExpiredRerun(t *testing.T) {

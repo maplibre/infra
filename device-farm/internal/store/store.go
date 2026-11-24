@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -19,13 +20,17 @@ const (
 	BranchKeyIndex = "branch_key-index"
 	SHAIndex       = "sha-index"
 	RecordTTL      = 30 * 24 * time.Hour
+	// ClaimLeaseTTL (5m30s) exceeds the 300s worker Lambda timeout and is shorter
+	// than the 360s SQS visibility timeout so retries after a crash can take over.
+	ClaimLeaseTTL = 330 * time.Second
 )
 
 // ErrStateConflict is returned when a conditional state transition fails because
 // the record is no longer in the expected state.
 var ErrStateConflict = errors.New("run record state conflict")
 
-// ErrAlreadyClaimed is returned when another invocation already claimed a workflow run attempt.
+// ErrAlreadyClaimed is returned when another invocation already holds an active
+// CLAIMING lease or finalized CLAIMED record for a workflow run attempt.
 var ErrAlreadyClaimed = errors.New("workflow run attempt already claimed")
 
 // DynamoAPI is the subset of the AWS DynamoDB client used by Store.
@@ -48,15 +53,18 @@ func New(client DynamoAPI, tableName string) *Store {
 	return &Store{client: client, tableName: tableName}
 }
 
-// ClaimWorkflowRun atomically claims a (repo, workflow_run_id, run_attempt) key in DynamoDB
-// with a 30-day TTL so concurrent or duplicate SQS deliveries cannot schedule duplicate runs.
-func (s *Store) ClaimWorkflowRun(ctx context.Context, claimKey string, now time.Time) error {
+// ClaimWorkflowRun acquires a short-lived ownership-scoped CLAIMING lease for
+// (repo, workflow_run_id, run_attempt). It succeeds when no record exists or an
+// existing CLAIMING lease has expired, preventing crashed invocations from wedging retries.
+func (s *Store) ClaimWorkflowRun(ctx context.Context, claimKey, owner string, now time.Time) error {
 	nowUTC := now.UTC()
 	av, err := attributevalue.MarshalMap(model.RunRecord{
-		RunARN:    claimKey,
-		State:     model.StateClaimed,
-		CreatedAt: nowUTC.Format(time.RFC3339Nano),
-		ExpiresAt: nowUTC.Add(RecordTTL).Unix(),
+		RunARN:         claimKey,
+		State:          model.StateClaiming,
+		ClaimOwner:     owner,
+		LeaseExpiresAt: nowUTC.Add(ClaimLeaseTTL).Unix(),
+		CreatedAt:      nowUTC.Format(time.RFC3339Nano),
+		ExpiresAt:      nowUTC.Add(RecordTTL).Unix(),
 	})
 	if err != nil {
 		return fmt.Errorf("marshal claim record: %w", err)
@@ -64,7 +72,14 @@ func (s *Store) ClaimWorkflowRun(ctx context.Context, claimKey string, now time.
 	_, err = s.client.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName:           aws.String(s.tableName),
 		Item:                av,
-		ConditionExpression: aws.String("attribute_not_exists(run_arn)"),
+		ConditionExpression: aws.String("attribute_not_exists(run_arn) OR (#state = :claiming AND lease_expires_at < :now)"),
+		ExpressionAttributeNames: map[string]string{
+			"#state": "state",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":claiming": &types.AttributeValueMemberS{Value: string(model.StateClaiming)},
+			":now":      &types.AttributeValueMemberN{Value: strconv.FormatInt(nowUTC.Unix(), 10)},
+		},
 	})
 	if err != nil {
 		var condErr *types.ConditionalCheckFailedException
@@ -72,6 +87,65 @@ func (s *Store) ClaimWorkflowRun(ctx context.Context, claimKey string, now time.
 			return ErrAlreadyClaimed
 		}
 		return fmt.Errorf("claim %s: %w", claimKey, err)
+	}
+	return nil
+}
+
+// CompleteWorkflowClaim transitions an owned CLAIMING lease to a permanent 30-day CLAIMED record.
+func (s *Store) CompleteWorkflowClaim(ctx context.Context, claimKey, owner string, now time.Time) error {
+	nowUTC := now.UTC()
+	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(s.tableName),
+		Key: map[string]types.AttributeValue{
+			"run_arn": &types.AttributeValueMemberS{Value: claimKey},
+		},
+		ConditionExpression: aws.String("#state = :claiming AND claim_owner = :owner"),
+		UpdateExpression:    aws.String("SET #state = :claimed, updated_at = :updated_at, expires_at = :expires_at REMOVE lease_expires_at"),
+		ExpressionAttributeNames: map[string]string{
+			"#state": "state",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":claiming":   &types.AttributeValueMemberS{Value: string(model.StateClaiming)},
+			":claimed":    &types.AttributeValueMemberS{Value: string(model.StateClaimed)},
+			":owner":      &types.AttributeValueMemberS{Value: owner},
+			":updated_at": &types.AttributeValueMemberS{Value: nowUTC.Format(time.RFC3339Nano)},
+			":expires_at": &types.AttributeValueMemberN{Value: strconv.FormatInt(nowUTC.Add(RecordTTL).Unix(), 10)},
+		},
+	})
+	if err != nil {
+		var condErr *types.ConditionalCheckFailedException
+		if errors.As(err, &condErr) {
+			return ErrStateConflict
+		}
+		return fmt.Errorf("complete claim %s: %w", claimKey, err)
+	}
+	return nil
+}
+
+// ReleaseWorkflowClaim deletes an owned CLAIMING lease after a transient failure.
+// ConditionalCheckFailedException is ignored so a slow invocation can never delete
+// another owner's lease or a finalized CLAIMED record.
+func (s *Store) ReleaseWorkflowClaim(ctx context.Context, claimKey, owner string) error {
+	_, err := s.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName: aws.String(s.tableName),
+		Key: map[string]types.AttributeValue{
+			"run_arn": &types.AttributeValueMemberS{Value: claimKey},
+		},
+		ConditionExpression: aws.String("#state = :claiming AND claim_owner = :owner"),
+		ExpressionAttributeNames: map[string]string{
+			"#state": "state",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":claiming": &types.AttributeValueMemberS{Value: string(model.StateClaiming)},
+			":owner":    &types.AttributeValueMemberS{Value: owner},
+		},
+	})
+	if err != nil {
+		var condErr *types.ConditionalCheckFailedException
+		if errors.As(err, &condErr) {
+			return nil
+		}
+		return fmt.Errorf("release claim %s: %w", claimKey, err)
 	}
 	return nil
 }
@@ -114,7 +188,7 @@ func (s *Store) GetRun(ctx context.Context, runARN string) (model.RunRecord, boo
 	return rec, true, nil
 }
 
-// DeleteRun deletes a record by run_arn (used to clean up temporary pending tracking items).
+// DeleteRun deletes a record by run_arn.
 func (s *Store) DeleteRun(ctx context.Context, runARN string) error {
 	_, err := s.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 		TableName: aws.String(s.tableName),

@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -16,15 +17,20 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/maplibre/infra/device-farm/internal/config"
+	"github.com/maplibre/infra/device-farm/internal/devicefarm"
 	"github.com/maplibre/infra/device-farm/internal/github"
 	"github.com/maplibre/infra/device-farm/internal/model"
 )
 
 type fakeGH struct {
-	updates []github.UpdateCheckRunRequest
+	updates   []github.UpdateCheckRunRequest
+	updateErr error
 }
 
 func (f *fakeGH) UpdateCheckRun(_ context.Context, _ int64, _, _ string, _ int64, in github.UpdateCheckRunRequest) (github.CheckRun, error) {
+	if f.updateErr != nil {
+		return github.CheckRun{}, f.updateErr
+	}
 	f.updates = append(f.updates, in)
 	return github.CheckRun{}, nil
 }
@@ -56,11 +62,15 @@ func (s *fakeStore) MarkFailed(_ context.Context, arn, result string, _ time.Tim
 
 type fakeDF struct {
 	run       *dftypes.Run
+	getRunErr error
 	jobs      []dftypes.Job
 	artifacts map[string][]dftypes.Artifact
 }
 
 func (d *fakeDF) GetRun(_ context.Context, _ string) (*dftypes.Run, error) {
+	if d.getRunErr != nil {
+		return nil, d.getRunErr
+	}
 	return d.run, nil
 }
 
@@ -246,5 +256,46 @@ func TestPollerLeavesRunningRunAlone(t *testing.T) {
 	}
 	if len(gh.updates) != 0 || len(s3c.objects) != 0 || len(st.completed) != 0 {
 		t.Fatal("expected running run to be left untouched")
+	}
+}
+
+func TestPollerNotFoundRetriesUntilCheckRunUpdated(t *testing.T) {
+	runARN := "arn:aws:devicefarm:us-west-2:373521797162:run:proj-id/missing-run"
+	st := &fakeStore{
+		active: []model.RunRecord{
+			{
+				RunARN:         runARN,
+				State:          model.StateActive,
+				Repo:           "maplibre/mln-rs",
+				SHA:            "abcdef123456",
+				CheckRunID:     321,
+				InstallationID: 77,
+			},
+		},
+	}
+	df := &fakeDF{getRunErr: devicefarm.ErrRunNotFound}
+	gh := &fakeGH{updateErr: errors.New("github 502")}
+	s3c := &fakeS3{}
+
+	h := NewHandler(testPollerCfg(), gh, st, df, s3c, nil)
+
+	// First poll: UpdateCheckRun fails transiently -> Handle returns error and leaves record ACTIVE.
+	if err := h.Handle(context.Background()); err == nil {
+		t.Fatal("expected error when UpdateCheckRun fails on ErrRunNotFound")
+	}
+	if len(st.completed) != 0 {
+		t.Fatalf("expected record to remain ACTIVE after Check Run update error, got completed=%v", st.completed)
+	}
+
+	// Next poll: UpdateCheckRun succeeds -> Check Run marked failure and DynamoDB marked FAILED:NOT_FOUND.
+	gh.updateErr = nil
+	if err := h.Handle(context.Background()); err != nil {
+		t.Fatalf("Handle() retry error = %v", err)
+	}
+	if len(gh.updates) != 1 || gh.updates[0].Status != "completed" || gh.updates[0].Conclusion != "failure" {
+		t.Fatalf("unexpected check run updates: %+v", gh.updates)
+	}
+	if st.completed[runARN] != "FAILED:NOT_FOUND" {
+		t.Fatalf("completed state = %q, want FAILED:NOT_FOUND", st.completed[runARN])
 	}
 }

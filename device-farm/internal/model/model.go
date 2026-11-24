@@ -39,7 +39,9 @@ type JobMessage struct {
 type RunState string
 
 const (
-	// StateClaimed marks an atomic idempotency claim for a (repo, workflow_run_id, run_attempt).
+	// StateClaiming marks a short-lived ownership lease while a worker schedules a workflow attempt.
+	StateClaiming RunState = "CLAIMING"
+	// StateClaimed marks a finalized idempotency claim for a (repo, workflow_run_id, run_attempt).
 	StateClaimed RunState = "CLAIMED"
 	// StateActive marks a Device Farm run that the poller is watching.
 	StateActive RunState = "ACTIVE"
@@ -55,6 +57,8 @@ const (
 type RunRecord struct {
 	RunARN             string   `dynamodbav:"run_arn"`
 	State              RunState `dynamodbav:"state"`
+	ClaimOwner         string   `dynamodbav:"claim_owner,omitempty"`
+	LeaseExpiresAt     int64    `dynamodbav:"lease_expires_at,omitempty"`
 	CreatedAt          string   `dynamodbav:"created_at"`
 	BranchKey          string   `dynamodbav:"branch_key,omitempty"`
 	RepoSHA            string   `dynamodbav:"repo_sha,omitempty"`

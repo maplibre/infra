@@ -117,7 +117,7 @@ func (h *Handler) pollRun(ctx context.Context, rec model.RunRecord) error {
 		if errors.Is(err, devicefarm.ErrRunNotFound) {
 			now := h.now().UTC()
 			if rec.CheckRunID > 0 {
-				_, _ = h.gh.UpdateCheckRun(ctx, rec.InstallationID, repo.Owner, repo.Name, rec.CheckRunID, github.UpdateCheckRunRequest{
+				if _, updateErr := h.gh.UpdateCheckRun(ctx, rec.InstallationID, repo.Owner, repo.Name, rec.CheckRunID, github.UpdateCheckRunRequest{
 					Status:      "completed",
 					Conclusion:  "failure",
 					CompletedAt: now.Format(time.RFC3339),
@@ -125,7 +125,9 @@ func (h *Handler) pollRun(ctx context.Context, rec model.RunRecord) error {
 						Title:   "Device Farm run not found",
 						Summary: "The AWS Device Farm run could not be found (it may have been deleted).",
 					},
-				})
+				}); updateErr != nil {
+					return fmt.Errorf("update check run %d for missing run: %w", rec.CheckRunID, updateErr)
+				}
 			}
 			if markErr := h.store.MarkFailed(ctx, rec.RunARN, "NOT_FOUND", now); markErr != nil && !errors.Is(markErr, store.ErrStateConflict) {
 				return markErr

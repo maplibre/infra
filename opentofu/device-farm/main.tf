@@ -1,7 +1,7 @@
 terraform {
   required_version = ">= 1.11, < 2.0"
   required_providers {
-    aws = { source = "hashicorp/aws", version = "~> 6.0" }
+    aws = { source = "hashicorp/aws", version = ">= 6.18, < 7.0" }
   }
   backend "s3" {
     bucket       = "maplibre-ci-runners-tofu-state-373521797162"
@@ -322,6 +322,22 @@ resource "aws_lambda_function" "webhook" {
 resource "aws_lambda_function_url" "webhook" {
   function_name      = aws_lambda_function.webhook.function_name
   authorization_type = "NONE"
+}
+
+resource "aws_lambda_permission" "webhook_function_url" {
+  statement_id           = "AllowPublicFunctionUrl"
+  action                 = "lambda:InvokeFunctionUrl"
+  function_name          = aws_lambda_function.webhook.function_name
+  principal              = "*"
+  function_url_auth_type = "NONE"
+}
+
+resource "aws_lambda_permission" "webhook_invoke_via_url" {
+  statement_id             = "AllowPublicInvokeViaFunctionUrl"
+  action                   = "lambda:InvokeFunction"
+  function_name            = aws_lambda_function.webhook.function_name
+  principal                = "*"
+  invoked_via_function_url = true
 }
 
 # --- Worker Lambda ---

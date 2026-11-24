@@ -18,9 +18,11 @@ type fakeDynamoAPI struct {
 	lastPut    *dynamodb.PutItemInput
 	lastQuery  *dynamodb.QueryInput
 	lastUpdate *dynamodb.UpdateItemInput
+	lastDelete *dynamodb.DeleteItemInput
 	queryPages [][]model.RunRecord
 	putErr     error
 	updateErr  error
+	deleteErr  error
 }
 
 func (f *fakeDynamoAPI) PutItem(_ context.Context, params *dynamodb.PutItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error) {
@@ -37,8 +39,9 @@ func (f *fakeDynamoAPI) UpdateItem(_ context.Context, params *dynamodb.UpdateIte
 	return &dynamodb.UpdateItemOutput{}, f.updateErr
 }
 
-func (f *fakeDynamoAPI) DeleteItem(_ context.Context, _ *dynamodb.DeleteItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.DeleteItemOutput, error) {
-	return &dynamodb.DeleteItemOutput{}, nil
+func (f *fakeDynamoAPI) DeleteItem(_ context.Context, params *dynamodb.DeleteItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.DeleteItemOutput, error) {
+	f.lastDelete = params
+	return &dynamodb.DeleteItemOutput{}, f.deleteErr
 }
 
 func (f *fakeDynamoAPI) Query(_ context.Context, params *dynamodb.QueryInput, _ ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error) {
@@ -93,16 +96,30 @@ func TestStoreQueriesAndTransitions(t *testing.T) {
 	}
 }
 
-func TestClaimWorkflowRun(t *testing.T) {
+func TestClaimWorkflowRunLeaseLifecycle(t *testing.T) {
 	fake := &fakeDynamoAPI{}
 	st := New(fake, "runs-table")
 
+	now := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
 	key := model.ClaimKey("maplibre/mln-rs", 123, 2)
-	if err := st.ClaimWorkflowRun(context.Background(), key, time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)); err != nil {
+	owner := "owner-token-1"
+
+	if err := st.ClaimWorkflowRun(context.Background(), key, owner, now); err != nil {
 		t.Fatalf("ClaimWorkflowRun() error = %v", err)
 	}
-	if aws.ToString(fake.lastPut.ConditionExpression) != "attribute_not_exists(run_arn)" {
-		t.Fatalf("ConditionExpression = %q, want attribute_not_exists(run_arn)", aws.ToString(fake.lastPut.ConditionExpression))
+	wantCond := "attribute_not_exists(run_arn) OR (#state = :claiming AND lease_expires_at < :now)"
+	if aws.ToString(fake.lastPut.ConditionExpression) != wantCond {
+		t.Fatalf("ConditionExpression = %q, want %q", aws.ToString(fake.lastPut.ConditionExpression), wantCond)
+	}
+	var item model.RunRecord
+	if err := attributevalue.UnmarshalMap(fake.lastPut.Item, &item); err != nil {
+		t.Fatalf("unmarshal claim item: %v", err)
+	}
+	if item.State != model.StateClaiming || item.ClaimOwner != owner {
+		t.Fatalf("claim item state=%q owner=%q, want CLAIMING/%q", item.State, item.ClaimOwner, owner)
+	}
+	if item.LeaseExpiresAt != now.Add(ClaimLeaseTTL).Unix() {
+		t.Fatalf("LeaseExpiresAt = %d, want %d", item.LeaseExpiresAt, now.Add(ClaimLeaseTTL).Unix())
 	}
 	if _, hasBranch := fake.lastPut.Item["branch_key"]; hasBranch {
 		t.Fatal("claim item should omit branch_key")
@@ -112,8 +129,37 @@ func TestClaimWorkflowRun(t *testing.T) {
 	}
 
 	fake.putErr = &types.ConditionalCheckFailedException{Message: aws.String("exists")}
-	err := st.ClaimWorkflowRun(context.Background(), key, time.Now())
-	if !errors.Is(err, ErrAlreadyClaimed) {
+	if err := st.ClaimWorkflowRun(context.Background(), key, owner, now); !errors.Is(err, ErrAlreadyClaimed) {
 		t.Fatalf("expected ErrAlreadyClaimed, got %v", err)
+	}
+	fake.putErr = nil
+
+	if err := st.CompleteWorkflowClaim(context.Background(), key, owner, now.Add(time.Minute)); err != nil {
+		t.Fatalf("CompleteWorkflowClaim() error = %v", err)
+	}
+	if aws.ToString(fake.lastUpdate.ConditionExpression) != "#state = :claiming AND claim_owner = :owner" {
+		t.Fatalf("CompleteWorkflowClaim ConditionExpression = %q", aws.ToString(fake.lastUpdate.ConditionExpression))
+	}
+	if aws.ToString(fake.lastUpdate.UpdateExpression) != "SET #state = :claimed, updated_at = :updated_at, expires_at = :expires_at REMOVE lease_expires_at" {
+		t.Fatalf("CompleteWorkflowClaim UpdateExpression = %q", aws.ToString(fake.lastUpdate.UpdateExpression))
+	}
+
+	fake.updateErr = &types.ConditionalCheckFailedException{Message: aws.String("wrong owner")}
+	if err := st.CompleteWorkflowClaim(context.Background(), key, "other-owner", now); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("expected ErrStateConflict on mismatched CompleteWorkflowClaim, got %v", err)
+	}
+	fake.updateErr = nil
+
+	if err := st.ReleaseWorkflowClaim(context.Background(), key, owner); err != nil {
+		t.Fatalf("ReleaseWorkflowClaim() error = %v", err)
+	}
+	if aws.ToString(fake.lastDelete.ConditionExpression) != "#state = :claiming AND claim_owner = :owner" {
+		t.Fatalf("ReleaseWorkflowClaim ConditionExpression = %q", aws.ToString(fake.lastDelete.ConditionExpression))
+	}
+
+	// Ownership mismatch or already finalized CLAIMED must not return an error on release.
+	fake.deleteErr = &types.ConditionalCheckFailedException{Message: aws.String("taken over")}
+	if err := st.ReleaseWorkflowClaim(context.Background(), key, "stale-owner"); err != nil {
+		t.Fatalf("expected nil on ConditionalCheckFailedException in ReleaseWorkflowClaim, got %v", err)
 	}
 }
