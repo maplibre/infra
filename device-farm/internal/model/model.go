@@ -103,22 +103,42 @@ func ExternalID(workflowRunID int64, runAttempt int) string {
 	return fmt.Sprintf("%d:%d", workflowRunID, runAttempt)
 }
 
-// ParseExternalID parses "<workflowRunID>:<runAttempt>" (or legacy "<workflowRunID>").
+// RerunExternalID formats the GitHub Check Run external_id for a check_run.rerequested
+// delivery as "<workflowRunID>:<runAttempt>:<deliveryID>", falling back to ExternalID
+// when deliveryID is empty.
+func RerunExternalID(workflowRunID int64, runAttempt int, deliveryID string) string {
+	if workflowRunID <= 0 {
+		return ""
+	}
+	if deliveryID == "" {
+		return ExternalID(workflowRunID, runAttempt)
+	}
+	if runAttempt <= 0 {
+		runAttempt = 1
+	}
+	return fmt.Sprintf("%d:%d:%s", workflowRunID, runAttempt, deliveryID)
+}
+
+// ParseExternalID parses "<workflowRunID>", "<workflowRunID>:<runAttempt>", or
+// "<workflowRunID>:<runAttempt>:<deliveryID>".
 func ParseExternalID(raw string) (runID int64, attempt int, ok bool) {
 	if raw == "" {
 		return 0, 0, false
 	}
-	runPart, attemptPart, hasColon := strings.Cut(raw, ":")
-	id, err := strconv.ParseInt(runPart, 10, 64)
+	parts := strings.SplitN(raw, ":", 3)
+	id, err := strconv.ParseInt(parts[0], 10, 64)
 	if err != nil || id <= 0 {
 		return 0, 0, false
 	}
-	if !hasColon {
+	if len(parts) == 1 {
 		return id, 1, true
 	}
-	att, err := strconv.Atoi(attemptPart)
+	att, err := strconv.Atoi(parts[1])
 	if err != nil || att <= 0 {
-		return id, 1, true
+		return 0, 0, false
+	}
+	if len(parts) == 3 && parts[2] == "" {
+		return 0, 0, false
 	}
 	return id, att, true
 }

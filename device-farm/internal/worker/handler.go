@@ -36,7 +36,7 @@ type GitHubAPI interface {
 	UpdateCheckRun(ctx context.Context, installationID int64, owner, repo string, checkRunID int64, in github.UpdateCheckRunRequest) (github.CheckRun, error)
 	ListCheckRunsForRef(ctx context.Context, installationID int64, owner, repo, ref, checkName string) ([]github.CheckRun, error)
 	GetWorkflowRun(ctx context.Context, installationID int64, owner, repo string, runID int64) (github.WorkflowRun, error)
-	ListWorkflowRunJobs(ctx context.Context, installationID int64, owner, repo string, runID int64) ([]github.WorkflowJob, error)
+	ListWorkflowRunJobs(ctx context.Context, installationID int64, owner, repo string, runID int64, attempt int) ([]github.WorkflowJob, error)
 	ListWorkflowRunArtifacts(ctx context.Context, installationID int64, owner, repo string, runID int64, name string) ([]github.Artifact, error)
 	DownloadArtifact(ctx context.Context, installationID int64, owner, repo string, artifactID int64, dstPath string, maxBytes int64) error
 	GetRawFile(ctx context.Context, installationID int64, owner, repo, filePath, ref string) ([]byte, error)
@@ -191,7 +191,7 @@ func (h *Handler) handleWorkflowRun(ctx context.Context, repo config.RepoConfig,
 		return nil
 	}
 
-	jobs, err := h.gh.ListWorkflowRunJobs(ctx, msg.InstallationID, repo.Owner, repo.Name, msg.WorkflowRunID)
+	jobs, err := h.gh.ListWorkflowRunJobs(ctx, msg.InstallationID, repo.Owner, repo.Name, msg.WorkflowRunID, attempt)
 	if err != nil {
 		return err
 	}
@@ -319,6 +319,9 @@ func (h *Handler) scheduleDeviceFarmRun(ctx context.Context, repo config.RepoCon
 	}
 	workflowCreatedAt := wfRun.CreatedAt.UTC()
 	extID := model.ExternalID(msg.WorkflowRunID, runAttempt)
+	if isRerun && msg.DeliveryID != "" {
+		extID = model.RerunExternalID(msg.WorkflowRunID, runAttempt, msg.DeliveryID)
+	}
 
 	// Acquire a recoverable ownership-scoped CLAIMING lease before creating checks,
 	// superseding runs, or uploading packages.
@@ -420,9 +423,10 @@ func (h *Handler) scheduleDeviceFarmRun(ctx context.Context, repo config.RepoCon
 		}
 	}
 
-	// On SQS retry after a transient failure, reuse any open Check Run for this attempt.
+	// On SQS retry after a transient failure, reuse any open Check Run for this attempt
+	// (or for this specific rerun delivery_id).
 	var existingCheckRunID int64
-	if !isRerun {
+	if !isRerun || msg.DeliveryID != "" {
 		_, existingCheckRunID, err = h.findCheckRunForExternalID(ctx, repo, msg.InstallationID, headSHA, extID)
 		if err != nil {
 			releaseClaim()

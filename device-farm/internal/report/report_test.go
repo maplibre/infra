@@ -189,3 +189,38 @@ func TestMapRunResult(t *testing.T) {
 		t.Fatalf("ERRORED -> %q", got)
 	}
 }
+
+func TestTailLinesLargeBufferAndCRLF(t *testing.T) {
+	large := []byte(strings.Repeat("\n", 200_000) + "line-a\r\nline-b\r\nline-c\r\n")
+	got := TailLines(large, 2)
+	want := []string{"line-b", "line-c"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("TailLines(large, 2) = %#v, want %#v", got, want)
+	}
+
+	got3 := TailLines(large, 3)
+	want3 := []string{"line-a", "line-b", "line-c"}
+	if len(got3) != len(want3) || got3[0] != want3[0] || got3[1] != want3[1] || got3[2] != want3[2] {
+		t.Fatalf("TailLines(large, 3) = %#v, want %#v", got3, want3)
+	}
+
+	// Edge cases matching TrimSuffix(normalized, "\n") semantics.
+	if res := TailLines(nil, 5); res != nil {
+		t.Fatalf("TailLines(nil, 5) = %#v, want nil", res)
+	}
+	if res := TailLines([]byte("a\nb"), 0); res != nil {
+		t.Fatalf("TailLines(data, 0) = %#v, want nil", res)
+	}
+	if res := TailLines([]byte("\n"), 5); res != nil {
+		t.Fatalf("TailLines(\\n, 5) = %#v, want nil", res)
+	}
+	if res := TailLines([]byte("\r\n"), 5); res != nil {
+		t.Fatalf("TailLines(\\r\\n, 5) = %#v, want nil", res)
+	}
+	if res := TailLines([]byte("\n\n"), 5); len(res) != 2 || res[0] != "" || res[1] != "" {
+		t.Fatalf("TailLines(\\n\\n, 5) = %#v, want []string{\"\", \"\"}", res)
+	}
+	if res := TailLines([]byte("only-one-line"), 5); len(res) != 1 || res[0] != "only-one-line" {
+		t.Fatalf("TailLines(single, 5) = %#v, want [only-one-line]", res)
+	}
+}

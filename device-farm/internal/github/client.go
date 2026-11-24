@@ -396,12 +396,19 @@ func (c *Client) GetWorkflowRun(ctx context.Context, installationID int64, owner
 	return out, err
 }
 
-// ListWorkflowRunJobs returns all jobs belonging to a GitHub Actions workflow run.
-func (c *Client) ListWorkflowRunJobs(ctx context.Context, installationID int64, owner, repo string, runID int64) ([]WorkflowJob, error) {
+// ListWorkflowRunJobs returns all jobs belonging to a GitHub Actions workflow run
+// (scoped to attempt when attempt > 0).
+func (c *Client) ListWorkflowRunJobs(ctx context.Context, installationID int64, owner, repo string, runID int64, attempt int) ([]WorkflowJob, error) {
 	var all []WorkflowJob
 	for page := 1; page <= 10; page++ {
-		path := fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?per_page=100&page=%d",
-			url.PathEscape(owner), url.PathEscape(repo), runID, page)
+		var path string
+		if attempt > 0 {
+			path = fmt.Sprintf("/repos/%s/%s/actions/runs/%d/attempts/%d/jobs?per_page=100&page=%d",
+				url.PathEscape(owner), url.PathEscape(repo), runID, attempt, page)
+		} else {
+			path = fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?per_page=100&page=%d",
+				url.PathEscape(owner), url.PathEscape(repo), runID, page)
+		}
 		var resp struct {
 			TotalCount int           `json:"total_count"`
 			Jobs       []WorkflowJob `json:"jobs"`

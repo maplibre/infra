@@ -37,6 +37,8 @@ type fakeGH struct {
 	rawFileRef         string
 	rawFileBytes       []byte
 	lastWorkflowRunID  int64
+	lastJobsRunID      int64
+	lastJobsAttempt    int
 }
 
 func newFakeGH() *fakeGH {
@@ -99,7 +101,11 @@ func (f *fakeGH) GetWorkflowRun(_ context.Context, _ int64, _, _ string, runID i
 	return f.workflowRun, nil
 }
 
-func (f *fakeGH) ListWorkflowRunJobs(_ context.Context, _ int64, _, _ string, _ int64) ([]github.WorkflowJob, error) {
+func (f *fakeGH) ListWorkflowRunJobs(_ context.Context, _ int64, _, _ string, runID int64, attempt int) ([]github.WorkflowJob, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastJobsRunID = runID
+	f.lastJobsAttempt = attempt
 	return f.jobs, nil
 }
 
@@ -1076,6 +1082,9 @@ func TestWorkerSkippedJobAndSafetyNetAndExpiredRerun(t *testing.T) {
 		if err != nil || len(resp.BatchItemFailures) != 0 {
 			t.Fatalf("Handle() err=%v failures=%v", err, resp.BatchItemFailures)
 		}
+		if gh.lastJobsRunID != 601 || gh.lastJobsAttempt != 2 {
+			t.Fatalf("ListWorkflowRunJobs called with runID=%d attempt=%d, want 601/2", gh.lastJobsRunID, gh.lastJobsAttempt)
+		}
 		if len(gh.created) != 1 || gh.created[0].Conclusion != "success" || gh.created[0].ExternalID != "601:2" {
 			t.Fatalf("expected safety net to create success check run for 601:2, got %+v", gh.created)
 		}
@@ -1158,6 +1167,9 @@ func TestWorkerRerunDeliveryDeduplication(t *testing.T) {
 		if len(df.scheduledIn) != 1 {
 			t.Fatalf("scheduledIn = %d, want 1", len(df.scheduledIn))
 		}
+		if len(gh.created) != 1 || gh.created[0].ExternalID != "750:1:delivery-1" {
+			t.Fatalf("expected delivery-scoped external_id 750:1:delivery-1, got %+v", gh.created)
+		}
 		claimKey := model.RerunClaimKey("maplibre/mln-rs", "delivery-1")
 		if rec := st.records[claimKey]; rec.State != model.StateClaimed || rec.LeaseExpiresAt != 0 {
 			t.Fatalf("expected finalized CLAIMED rerun claim, got %+v", rec)
@@ -1185,8 +1197,64 @@ func TestWorkerRerunDeliveryDeduplication(t *testing.T) {
 		if len(df.scheduledIn) != 2 {
 			t.Fatalf("scheduledIn = %d, want 2 for distinct DeliveryID", len(df.scheduledIn))
 		}
+		if len(gh.created) != 2 || gh.created[1].ExternalID != "750:1:delivery-2" {
+			t.Fatalf("expected second rerun external_id 750:1:delivery-2, got %+v", gh.created)
+		}
 		if st.records["arn:aws:devicefarm:us-west-2:373521797162:run:proj/run-2"].RerunDeliveryID != "delivery-2" {
 			t.Fatalf("expected run-2 RerunDeliveryID=delivery-2, got %+v", st.records["arn:aws:devicefarm:us-west-2:373521797162:run:proj/run-2"])
+		}
+	})
+
+	t.Run("transient error during rerun reuses existing open Check Run on retry", func(t *testing.T) {
+		gh := newFakeGH()
+		gh.workflowRun = github.WorkflowRun{ID: 752, RunAttempt: 1, HeadBranch: "main", HeadSHA: "rerun-retry-sha", CreatedAt: now}
+		gh.workflowRun.HeadRepository.FullName = "maplibre/mln-rs"
+		gh.artifacts = []github.Artifact{{ID: 53, Name: "android-device-tests", CreatedAt: now}}
+
+		st := newFakeStore()
+		df := &fakeDF{uploadErr: errors.New("temporary upload 503")}
+		h := NewHandler(testWorkerCfg(), gh, st, df, nil)
+		h.now = func() time.Time { return now }
+
+		msg := model.JobMessage{
+			Event:          model.EventCheckRun,
+			Action:         "rerequested",
+			DeliveryID:     "delivery-retry",
+			Repo:           "maplibre/mln-rs",
+			InstallationID: 99,
+			HeadSHA:        "rerun-retry-sha",
+			CheckRunID:     50,
+			ExternalID:     "752:1:earlier-delivery",
+		}
+
+		// First attempt creates the open Scheduling Check Run, fails on upload, and releases the rerun claim.
+		resp, err := h.Handle(context.Background(), sqsEventOf(t, msg))
+		if err != nil || len(resp.BatchItemFailures) != 1 {
+			t.Fatalf("expected 1 batch failure on transient upload error, got err=%v failures=%v", err, resp.BatchItemFailures)
+		}
+		if len(gh.created) != 1 || gh.created[0].ExternalID != "752:1:delivery-retry" {
+			t.Fatalf("expected 1 created check run with external_id 752:1:delivery-retry, got %+v", gh.created)
+		}
+		firstCheckID := gh.nextCheckID
+		if _, stillClaimed := st.records[model.RerunClaimKey("maplibre/mln-rs", "delivery-retry")]; stillClaimed {
+			t.Fatal("expected rerun claim to be released after transient upload error")
+		}
+
+		// SQS retry succeeds and reuses the exact same open Check Run ID instead of creating a duplicate.
+		df.uploadErr = nil
+		resp, err = h.Handle(context.Background(), sqsEventOf(t, msg))
+		if err != nil || len(resp.BatchItemFailures) != 0 {
+			t.Fatalf("rerun retry failed: err=%v failures=%v", err, resp.BatchItemFailures)
+		}
+		if len(gh.created) != 1 {
+			t.Fatalf("expected retry to reuse open Check Run (1 created), got %d created", len(gh.created))
+		}
+		if len(df.scheduledIn) != 1 {
+			t.Fatalf("scheduledIn = %d, want 1", len(df.scheduledIn))
+		}
+		runRec := st.records["arn:aws:devicefarm:us-west-2:373521797162:run:proj/run-1"]
+		if runRec.CheckRunID != firstCheckID {
+			t.Fatalf("persisted CheckRunID = %d, want reused %d", runRec.CheckRunID, firstCheckID)
 		}
 	})
 

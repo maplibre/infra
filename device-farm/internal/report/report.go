@@ -252,16 +252,29 @@ func TailLines(data []byte, n int) []string {
 	if n <= 0 || len(data) == 0 {
 		return nil
 	}
-	text := strings.ReplaceAll(string(data), "\r\n", "\n")
-	text = strings.TrimSuffix(text, "\n")
-	if text == "" {
+	end := len(data)
+	if data[end-1] == '\n' {
+		end--
+		if end > 0 && data[end-1] == '\r' {
+			end--
+		}
+	}
+	if end == 0 {
 		return nil
 	}
-	lines := strings.Split(text, "\n")
-	if len(lines) > n {
-		lines = lines[len(lines)-n:]
+	start := 0
+	newlines := 0
+	for i := end - 1; i >= 0; i-- {
+		if data[i] == '\n' {
+			newlines++
+			if newlines == n {
+				start = i + 1
+				break
+			}
+		}
 	}
-	return lines
+	text := strings.ReplaceAll(string(data[start:end]), "\r\n", "\n")
+	return strings.Split(text, "\n")
 }
 
 // MapRunResult maps an AWS Device Farm ExecutionResult to a GitHub Check Run conclusion.

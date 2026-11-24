@@ -185,3 +185,57 @@ func TestDownloadArtifactStripsAuthOnRedirectAndCachesToken(t *testing.T) {
 		t.Fatalf("token exchanges = %d, want 1 (cached)", tokenExchanges.Load())
 	}
 }
+
+func TestListWorkflowRunJobsAttemptEndpoint(t *testing.T) {
+	_, pemText := generateTestKeyPEM(t, false)
+	var seenPaths []string
+
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/app/installations/77/access_tokens":
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"token":      "ghs_test_token",
+				"expires_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+			})
+		case "/repos/maplibre/mln-rs/actions/runs/555/attempts/2/jobs",
+			"/repos/maplibre/mln-rs/actions/runs/555/jobs":
+			seenPaths = append(seenPaths, r.URL.RequestURI())
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"total_count": 1,
+				"jobs": []map[string]any{
+					{"id": 10, "name": "prepare-device-tests", "conclusion": "skipped"},
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer apiServer.Close()
+
+	c := NewClient(staticCreds{creds: secrets.AppCredentials{
+		AppID:         "123",
+		PrivateKeyPEM: pemText,
+	}})
+	c.apiBaseURL = apiServer.URL
+
+	jobs, err := c.ListWorkflowRunJobs(context.Background(), 77, "maplibre", "mln-rs", 555, 2)
+	if err != nil {
+		t.Fatalf("ListWorkflowRunJobs(attempt=2) error = %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].Name != "prepare-device-tests" {
+		t.Fatalf("unexpected jobs: %+v", jobs)
+	}
+
+	if _, err := c.ListWorkflowRunJobs(context.Background(), 77, "maplibre", "mln-rs", 555, 0); err != nil {
+		t.Fatalf("ListWorkflowRunJobs(attempt=0) error = %v", err)
+	}
+
+	want := []string{
+		"/repos/maplibre/mln-rs/actions/runs/555/attempts/2/jobs?per_page=100&page=1",
+		"/repos/maplibre/mln-rs/actions/runs/555/jobs?per_page=100&page=1",
+	}
+	if len(seenPaths) != len(want) || seenPaths[0] != want[0] || seenPaths[1] != want[1] {
+		t.Fatalf("seenPaths = %#v, want %#v", seenPaths, want)
+	}
+}
