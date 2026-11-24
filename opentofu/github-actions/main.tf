@@ -39,15 +39,9 @@ data "aws_iam_openid_connect_provider" "github" {
 locals {
   issuer = "token.actions.githubusercontent.com"
   # The repositories with a workflow-run environment, for their workflow_run
-  # jobs, which handle artifacts that fork pull requests control, and the role
-  # that each environment's jobs assume.
+  # jobs, which handle artifacts that fork pull requests control.
   workflow_run_repositories = toset(["maplibre-native", "mln-rs"])
-  workflow_run_roles = {
-    "maplibre-native" = aws_iam_role.workflow_run.arn
-    "mln-rs"          = aws_iam_role.device_farm.arn
-  }
-  workflow_run_subject = "repo:maplibre/maplibre-native:environment:${github_repository_environment.workflow_run["maplibre-native"].environment}"
-  device_farm_project  = "20687d72-0e46-403e-8f03-0941850665bc"
+  workflow_run_subject      = "repo:maplibre/maplibre-native:environment:${github_repository_environment.workflow_run["maplibre-native"].environment}"
 }
 import {
   to = aws_iam_role.github_actions
@@ -81,18 +75,21 @@ resource "aws_iam_role_policy_attachments_exclusive" "github_actions" {
     "arn:aws:iam::373521797162:policy/github-actions-s3-buckets",
   ]
 }
-# maplibre-native's workflow_run jobs handle artifacts that fork pull requests
-# control, so they can only publish results and run device tests.
+# The workflows of every maplibre repository, among them the workflow_run jobs
+# of the workflow-run environments, can only publish maplibre-native's results
+# and run tests on AWS Device Farm's phones, in any of the account's projects.
+# The subjects come in two forms: repo:maplibre/REPO, and the immutable
+# repo:maplibre@ORG_ID/REPO@REPO_ID of repositories that use those.
 resource "aws_iam_role" "workflow_run" {
   name                 = "GitHubActionsWorkflowRun"
   max_session_duration = 14400 # device tests request four-hour sessions
   assume_role_policy = jsonencode({ Version = "2012-10-17", Statement = [{
     Effect    = "Allow", Action = "sts:AssumeRoleWithWebIdentity"
     Principal = { Federated = data.aws_iam_openid_connect_provider.github.arn }
-    Condition = { StringEquals = {
-      "${local.issuer}:aud" = "sts.amazonaws.com"
-      "${local.issuer}:sub" = local.workflow_run_subject
-    } }
+    Condition = {
+      StringEquals = { "${local.issuer}:aud" = "sts.amazonaws.com" }
+      StringLike   = { "${local.issuer}:sub" = ["repo:maplibre/*", "repo:maplibre@${data.github_organization.maplibre.id}/*"] }
+    }
   }] })
 }
 resource "aws_iam_role_policy" "workflow_run" {
@@ -104,35 +101,6 @@ resource "aws_iam_role_policy" "workflow_run" {
       Resource = [for prefix in ["bloaty-results", "bloaty-results-ios", "benchmark-results", "android-benchmark-render"] :
       "arn:aws:s3:::maplibre-native/${prefix}/*"]
     },
-    {
-      Sid = "RunDeviceTests", Effect = "Allow"
-      Action = [for action in ["CreateUpload", "GetUpload", "ScheduleRun", "GetRun", "ListJobs", "ListSuites", "ListArtifacts"] :
-      "devicefarm:${action}"]
-      Resource = [for type in ["project", "upload", "devicepool", "run", "job", "suite", "test"] :
-      "arn:aws:devicefarm:us-west-2:373521797162:${type}:${local.device_farm_project}*"]
-    },
-  ] })
-}
-# Every maplibre repository's workflows can run tests on AWS Device Farm's
-# phones, in any of the account's projects, and nothing else. Its subjects come
-# in two forms: repo:maplibre/REPO, and the immutable
-# repo:maplibre@ORG_ID/REPO@REPO_ID of repositories that use those.
-resource "aws_iam_role" "device_farm" {
-  name                 = "GitHubActionsDeviceFarm"
-  max_session_duration = 14400 # a run can wait hours for a phone
-  assume_role_policy = jsonencode({ Version = "2012-10-17", Statement = [{
-    Effect    = "Allow", Action = "sts:AssumeRoleWithWebIdentity"
-    Principal = { Federated = data.aws_iam_openid_connect_provider.github.arn }
-    Condition = {
-      StringEquals = { "${local.issuer}:aud" = "sts.amazonaws.com" }
-      StringLike   = { "${local.issuer}:sub" = ["repo:maplibre/*", "repo:maplibre@${data.github_organization.maplibre.id}/*"] }
-    }
-  }] })
-}
-resource "aws_iam_role_policy" "device_farm" {
-  name = "run-device-tests"
-  role = aws_iam_role.device_farm.id
-  policy = jsonencode({ Version = "2012-10-17", Statement = [
     {
       Sid = "RunDeviceTests", Effect = "Allow"
       Action = [for action in [
@@ -192,7 +160,7 @@ resource "github_actions_environment_variable" "workflow_run_role" {
   repository    = each.value.repository
   environment   = each.value.environment
   variable_name = "OIDC_AWS_ROLE_TO_ASSUME"
-  value         = local.workflow_run_roles[each.key]
+  value         = aws_iam_role.workflow_run.arn
 }
 resource "github_actions_environment_variable" "mln_rs_device_farm_project" {
   repository    = github_repository_environment.workflow_run["mln-rs"].repository
