@@ -367,6 +367,7 @@ func (c *Client) ListCheckRunsForRef(ctx context.Context, installationID int64, 
 		if checkName != "" {
 			q.Set("check_name", checkName)
 		}
+		q.Set("filter", "all")
 		q.Set("per_page", "100")
 		q.Set("page", fmt.Sprintf("%d", page))
 

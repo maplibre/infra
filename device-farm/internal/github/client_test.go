@@ -239,3 +239,58 @@ func TestListWorkflowRunJobsAttemptEndpoint(t *testing.T) {
 		t.Fatalf("seenPaths = %#v, want %#v", seenPaths, want)
 	}
 }
+
+func TestListCheckRunsForRefUsesFilterAll(t *testing.T) {
+	_, pemText := generateTestKeyPEM(t, false)
+	var gotFilter, gotCheckName, gotPerPage, gotPage string
+
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/app/installations/77/access_tokens":
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"token":      "ghs_test_token",
+				"expires_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+			})
+		case "/repos/maplibre/mln-rs/commits/abc123/check-runs":
+			q := r.URL.Query()
+			gotFilter = q.Get("filter")
+			gotCheckName = q.Get("check_name")
+			gotPerPage = q.Get("per_page")
+			gotPage = q.Get("page")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"total_count": 2,
+				"check_runs": []map[string]any{
+					{"id": 101, "name": "Device Farm (Android)", "external_id": "555:1"},
+					{"id": 102, "name": "Device Farm (Android)", "external_id": "555:2"},
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer apiServer.Close()
+
+	c := NewClient(staticCreds{creds: secrets.AppCredentials{
+		AppID:         "123",
+		PrivateKeyPEM: pemText,
+	}})
+	c.apiBaseURL = apiServer.URL
+
+	runs, err := c.ListCheckRunsForRef(context.Background(), 77, "maplibre", "mln-rs", "abc123", "Device Farm (Android)")
+	if err != nil {
+		t.Fatalf("ListCheckRunsForRef() error = %v", err)
+	}
+	if gotFilter != "all" {
+		t.Fatalf("filter = %q, want %q", gotFilter, "all")
+	}
+	if gotCheckName != "Device Farm (Android)" {
+		t.Fatalf("check_name = %q, want %q", gotCheckName, "Device Farm (Android)")
+	}
+	if gotPerPage != "100" || gotPage != "1" {
+		t.Fatalf("pagination = (%q, %q), want (100, 1)", gotPerPage, gotPage)
+	}
+	if len(runs) != 2 || runs[0].ID != 101 || runs[1].ID != 102 {
+		t.Fatalf("unexpected check runs: %+v", runs)
+	}
+}
