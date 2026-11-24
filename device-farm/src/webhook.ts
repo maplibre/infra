@@ -1,15 +1,8 @@
-import { SendMessageCommand, type SQSClient } from "@aws-sdk/client-sqs";
 import { verify } from "@octokit/webhooks-methods";
 import type { APIGatewayProxyEventV2, APIGatewayProxyStructuredResultV2 } from "aws-lambda";
 import { branchAllowed, type Config, type JobMessage, lookupRepo } from "./config.js";
 
-export interface WebhookDeps {
-  cfg: Config;
-  getWebhookSecret: () => Promise<string>;
-  enqueue: (msg: JobMessage) => Promise<void>;
-}
-
-const jsonResp = (
+const json = (
   statusCode: number,
   body: Record<string, string>,
 ): APIGatewayProxyStructuredResultV2 => ({
@@ -19,31 +12,21 @@ const jsonResp = (
 });
 
 function header(headers: Record<string, string | undefined> | undefined, name: string): string {
-  if (!headers) return "";
   const lower = name.toLowerCase();
-  for (const [k, v] of Object.entries(headers)) {
+  for (const [k, v] of Object.entries(headers ?? {})) {
     if (k.toLowerCase() === lower) return v ?? "";
   }
   return "";
 }
 
-export function createSqsEnqueuer(sqs: SQSClient, queueUrl: string) {
-  return async (msg: JobMessage): Promise<void> => {
-    await sqs.send(
-      new SendMessageCommand({
-        QueueUrl: queueUrl,
-        MessageBody: JSON.stringify(msg),
-      }),
-    );
-  };
-}
-
 export async function handleWebhook(
   event: APIGatewayProxyEventV2,
-  deps: WebhookDeps,
+  cfg: Config,
+  getWebhookSecret: () => Promise<string>,
+  enqueue: (msg: JobMessage) => Promise<void>,
 ): Promise<APIGatewayProxyStructuredResultV2> {
   if (event.requestContext?.http?.method && event.requestContext.http.method !== "POST") {
-    return jsonResp(405, { error: "method not allowed" });
+    return json(405, { error: "method not allowed" });
   }
 
   const rawBody = event.isBase64Encoded
@@ -51,35 +34,27 @@ export async function handleWebhook(
     : (event.body ?? "");
 
   const signature = header(event.headers, "x-hub-signature-256");
-  const secret = await deps.getWebhookSecret();
-  if (!signature || !(await verify(secret, rawBody, signature))) {
-    return jsonResp(401, { error: "invalid signature" });
+  if (!signature || !(await verify(await getWebhookSecret(), rawBody, signature))) {
+    return json(401, { error: "invalid signature" });
   }
 
   const eventType = header(event.headers, "x-github-event");
-  const deliveryId = header(event.headers, "x-github-delivery");
-  if (eventType === "ping") return jsonResp(200, { status: "pong" });
+  if (eventType === "ping") return json(200, { status: "pong" });
 
   let payload: Record<string, any>;
   try {
     payload = JSON.parse(rawBody);
   } catch {
-    return jsonResp(400, { error: "invalid json" });
+    return json(400, { error: "invalid json" });
   }
 
-  const fullName: string = payload.repository?.full_name ?? "";
-  const repo = lookupRepo(deps.cfg, fullName);
-  if (!repo)
-    return jsonResp(200, {
-      status: "ignored",
-      reason: "unconfigured repository",
-    });
+  const repo = lookupRepo(cfg, payload.repository?.full_name ?? "");
+  if (!repo) return json(200, { status: "ignored", reason: "unconfigured repository" });
 
   const installationId: number = payload.installation?.id ?? 0;
-  if (!installationId) return jsonResp(400, { error: "missing installation.id" });
+  if (!installationId) return json(400, { error: "missing installation.id" });
 
   let msg: JobMessage | null = null;
-
   if (eventType === "workflow_job" && payload.action === "completed") {
     const job = payload.workflow_job;
     if (
@@ -91,7 +66,6 @@ export async function handleWebhook(
       msg = {
         event: "workflow_job",
         action: "completed",
-        deliveryId,
         repo: repo.fullName,
         installationId,
         headSha: job.head_sha,
@@ -107,7 +81,6 @@ export async function handleWebhook(
       msg = {
         event: "workflow_run",
         action: "completed",
-        deliveryId,
         repo: repo.fullName,
         installationId,
         headSha: run.head_sha,
@@ -115,7 +88,6 @@ export async function handleWebhook(
         headRepo: run.head_repository?.full_name || undefined,
         workflowRunId: run.id,
         workflowRunAttempt: run.run_attempt || 1,
-        workflowCreatedAt: run.created_at || undefined,
       };
     }
   } else if (eventType === "check_run" && payload.action === "rerequested") {
@@ -124,7 +96,6 @@ export async function handleWebhook(
       msg = {
         event: "check_run",
         action: "rerequested",
-        deliveryId,
         repo: repo.fullName,
         installationId,
         headSha: cr.head_sha,
@@ -135,11 +106,11 @@ export async function handleWebhook(
     }
   }
 
-  if (!msg) return jsonResp(200, { status: "ignored" });
-  if (msg.headBranch && !branchAllowed(deps.cfg, msg.headBranch)) {
-    return jsonResp(200, { status: "ignored", reason: "branch filtered" });
+  if (!msg) return json(200, { status: "ignored" });
+  if (msg.headBranch && !branchAllowed(cfg, msg.headBranch)) {
+    return json(200, { status: "ignored", reason: "branch filtered" });
   }
 
-  await deps.enqueue(msg);
-  return jsonResp(202, { status: "queued" });
+  await enqueue(msg);
+  return json(202, { status: "queued" });
 }

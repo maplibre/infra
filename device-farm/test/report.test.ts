@@ -48,12 +48,8 @@ describe("config & helpers", () => {
 
     assert.deepEqual(parseExternalId("123"), { runId: 123, attempt: 1 });
     assert.deepEqual(parseExternalId("123:2"), { runId: 123, attempt: 2 });
-    assert.deepEqual(parseExternalId("123:2:deliv-1"), {
-      runId: 123,
-      attempt: 2,
-    });
     assert.equal(parseExternalId("123:0"), null);
-    assert.equal(parseExternalId("123:2:"), null);
+    assert.equal(parseExternalId("123:2:extra"), null);
     assert.equal(parseExternalId("bad"), null);
   });
 

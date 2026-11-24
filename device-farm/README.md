@@ -17,15 +17,13 @@ runs in three modes selected by the `MODE` environment variable:
    job onto SQS, and returns `202 Accepted` in under a second.
 2. **`worker`** (`1024 MB`, `2048 MB /tmp`, `300s` timeout, SQS trigger with
    `batch_size = 1` and `ReportBatchItemFailures`): authenticates as the GitHub App
-   installation, atomically claims `(repo, workflow_run_id, run_attempt)` in
-   DynamoDB so duplicate or concurrent deliveries cannot double-schedule, checks
-   workflow ordering so stale commits never supersede newer `ACTIVE` runs on the
-   same `(repo, head_repo, head_branch)`, downloads the `android-device-tests`
-   Actions artifact without leaking the GitHub `Authorization` header to Azure Blob
-   Storage, extracts `android-tests.zip` without unpacking or executing its
-   contents, fetches `tools/device-farm/android.yml` from `main` (never from a PR
-   branch), uploads both to Device Farm, schedules the run, and records it in
-   DynamoDB.
+   installation, deduplicates against existing DynamoDB runs, stops any earlier
+   `ACTIVE` runs on the same `(repo, head_repo, head_branch)`, downloads the
+   `android-device-tests` Actions artifact without leaking the GitHub
+   `Authorization` header to Azure Blob Storage, extracts `android-tests.zip`
+   without unpacking or executing its contents, fetches
+   `tools/device-farm/android.yml` from `main` (never from a PR branch), uploads
+   both to Device Farm, schedules the run, and records it in DynamoDB.
 3. **`poller`** (`512 MB`, `1024 MB /tmp`, `120s` timeout, EventBridge `rate(1 minute)`):
    queries DynamoDB `state-index` for `ACTIVE` runs (exiting immediately when idle),
    checks `devicefarm:GetRun`, downloads `TESTSPEC_OUTPUT` and `CUSTOMER_ARTIFACT`
@@ -139,7 +137,7 @@ Then run `just device-farm::plan` and `just device-farm::apply`, and add
 
 ## Adding another repository (e.g. `maplibre/maplibre-native`)
 
-1. Add a `RepoConfig` entry to `defaultRepos` in [`src/config.ts`](src/config.ts)
+1. Add a `RepoConfig` entry to `cfg.repos` in [`src/config.ts`](src/config.ts)
    (and read an optional project ARN env var such as `MAPLIBRE_NATIVE_PROJECT_ARN`
    in `loadConfig`).
 2. Add the corresponding variable and Lambda environment variable in

@@ -50,10 +50,9 @@ export const phoneSlug = (name: string) =>
 
 export function consoleUrl(runArn: string): string {
   const parts = runArn.split(":");
-  const region = parts[3] ?? "";
   const [projectId, runId] = (parts[6] ?? "").split("/");
-  return region && projectId && runId
-    ? `https://${region}.console.aws.amazon.com/devicefarm/home?region=${region}#/mobile/projects/${projectId}/runs/${runId}`
+  return parts[3] && projectId && runId
+    ? `https://${parts[3]}.console.aws.amazon.com/devicefarm/home?region=${parts[3]}#/mobile/projects/${projectId}/runs/${runId}`
     : "";
 }
 
@@ -66,8 +65,7 @@ function byteLimit(maxBytes: number, onExceed: () => Error): Transform {
   let total = 0;
   return new Transform({
     transform(chunk: Buffer, _enc, cb) {
-      total += chunk.length;
-      cb(total > maxBytes ? onExceed() : null, chunk);
+      cb((total += chunk.length) > maxBytes ? onExceed() : null, chunk);
     },
   });
 }
@@ -76,9 +74,8 @@ export async function downloadStreamToFile(
   url: string,
   dstPath: string,
   maxBytes: number,
-  headers?: Record<string, string>,
 ): Promise<void> {
-  const resp = await fetch(url, { headers, redirect: "follow" });
+  const resp = await fetch(url, { redirect: "follow" });
   if (!resp.ok || !resp.body) throw new Error(`Download failed with HTTP ${resp.status}`);
   try {
     await pipeline(
@@ -92,55 +89,55 @@ export async function downloadStreamToFile(
   }
 }
 
-async function findZipEntry<T>(
+async function readZipMatch<T>(
   zipPath: string,
-  matcher: (entry: Entry) => boolean,
-  consume: (zf: ZipFile, entry: Entry) => Promise<T>,
-  maxEntries = MAX_ZIP_ENTRIES,
-): Promise<{ found: true; value: T } | { found: false }> {
+  match: (name: string) => boolean,
+  consume: (stream: NodeJS.ReadableStream, entry: Entry) => Promise<T>,
+): Promise<T | null> {
   const zf = await new Promise<ZipFile>((resolve, reject) => {
     yauzl.open(zipPath, { lazyEntries: true, autoClose: false }, (err, zip) => {
       if (err || !zip) {
         const code = (err as NodeJS.ErrnoException | null)?.code;
-        reject(
+        return reject(
           code === "ENOENT" || code === "EACCES" || code === "EISDIR"
             ? err
-            : new InvalidArchiveError(err?.message ?? "invalid zip archive", {
-                cause: err,
-              }),
+            : new InvalidArchiveError(err?.message ?? "invalid zip archive", { cause: err }),
         );
-        return;
       }
       resolve(zip);
     });
   });
 
   try {
-    if (zf.entryCount > maxEntries) {
+    if (zf.entryCount > MAX_ZIP_ENTRIES) {
       throw new InvalidArchiveError(
-        `ZIP archive declares ${zf.entryCount} entries (max ${maxEntries})`,
+        `ZIP archive declares ${zf.entryCount} entries (max ${MAX_ZIP_ENTRIES})`,
       );
     }
-    let seen = 0;
-    while (true) {
+    for (let seen = 0; ;) {
       const entry = await new Promise<Entry | null>((resolve, reject) => {
-        const done = () => {
-          zf.off("entry", onEntry);
-          zf.off("end", onEnd);
-          zf.off("error", onErr);
-        };
-        const onEntry = (e: Entry) => (done(), resolve(e));
+        const done = () => zf.off("entry", onE).off("end", onEnd).off("error", onErr);
+        const onE = (e: Entry) => (done(), resolve(e));
         const onEnd = () => (done(), resolve(null));
         const onErr = (err: Error) => (
           done(),
           reject(new InvalidArchiveError(err.message, { cause: err }))
         );
-        zf.once("entry", onEntry).once("end", onEnd).once("error", onErr).readEntry();
+        zf.once("entry", onE).once("end", onEnd).once("error", onErr).readEntry();
       });
-      if (!entry) return { found: false };
-      if (++seen > maxEntries) throw new InvalidArchiveError(`ZIP exceeds ${maxEntries} entries`);
-      if (!entry.fileName.endsWith("/") && matcher(entry)) {
-        return { found: true, value: await consume(zf, entry) };
+      if (!entry) return null;
+      if (++seen > MAX_ZIP_ENTRIES) {
+        throw new InvalidArchiveError(`ZIP exceeds ${MAX_ZIP_ENTRIES} entries`);
+      }
+      if (!entry.fileName.endsWith("/") && match(entry.fileName)) {
+        const stream = await new Promise<NodeJS.ReadableStream>((resolve, reject) => {
+          zf.openReadStream(entry, (err, s) =>
+            err || !s
+              ? reject(new InvalidArchiveError(err?.message ?? "failed to open zip entry"))
+              : resolve(s),
+          );
+        });
+        return await consume(stream, entry);
       }
     }
   } finally {
@@ -148,28 +145,16 @@ async function findZipEntry<T>(
   }
 }
 
-const openEntryStream = (zf: ZipFile, entry: Entry) =>
-  new Promise<NodeJS.ReadableStream>((resolve, reject) => {
-    zf.openReadStream(entry, (err, s) =>
-      err || !s
-        ? reject(
-            new InvalidArchiveError(err?.message ?? "failed to open zip entry", { cause: err }),
-          )
-        : resolve(s),
-    );
-  });
-
 export async function extractPackageFromZip(
   outerZipPath: string,
   targetFilename: string,
   dstPath: string,
   maxBytes: number,
 ): Promise<void> {
-  const res = await findZipEntry(
+  const found = await readZipMatch(
     outerZipPath,
-    (e) => e.fileName === targetFilename,
-    async (zf, entry) => {
-      const stream = await openEntryStream(zf, entry);
+    (name) => name === targetFilename,
+    async (stream) => {
       try {
         await pipeline(
           stream,
@@ -183,22 +168,23 @@ export async function extractPackageFromZip(
         await rm(dstPath, { force: true });
         throw err;
       }
+      return true;
     },
   );
-  if (!res.found) throw new PackageNotFoundError(targetFilename);
+  if (!found) throw new PackageNotFoundError(targetFilename);
 }
 
 export async function extractJUnitFromZip(
   zipPath: string,
   maxBytes = DEFAULT_JUNIT_MAX_BYTES,
 ): Promise<Buffer | null> {
-  const res = await findZipEntry(
+  return readZipMatch(
     zipPath,
-    (e) => e.fileName === "junit.xml" || e.fileName.endsWith("/junit.xml"),
-    async (zf, entry) => {
+    (name) => name === "junit.xml" || name.endsWith("/junit.xml"),
+    async (stream, entry) => {
       const chunks: Buffer[] = [];
       let total = 0;
-      for await (const chunk of await openEntryStream(zf, entry)) {
+      for await (const chunk of stream) {
         const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
         if ((total += buf.length) > maxBytes) {
           throw new InvalidArchiveError(`${entry.fileName} exceeds max size ${maxBytes} bytes`);
@@ -208,14 +194,12 @@ export async function extractJUnitFromZip(
       return Buffer.concat(chunks, total);
     },
   );
-  return res.found ? res.value : null;
 }
 
 const xmlParser = new XMLParser({
   ignoreAttributes: false,
   attributeNamePrefix: "@_",
-  isArray: (name) =>
-    name === "testsuite" || name === "testcase" || name === "failure" || name === "error",
+  isArray: (n) => n === "testsuite" || n === "testcase" || n === "failure" || n === "error",
 });
 
 export function parseJUnit(rawXml: string | Buffer): JUnitSummary {
@@ -237,18 +221,10 @@ export function parseJUnit(rawXml: string | Buffer): JUnitSummary {
   }
 
   const failedTests = cases
-    .filter(
-      (tc) =>
-        (Array.isArray(tc.failure) && tc.failure.length > 0) ||
-        (Array.isArray(tc.error) && tc.error.length > 0),
-    )
+    .filter((tc) => tc.failure?.length > 0 || tc.error?.length > 0)
     .map((tc) => `${tc["@_classname"] ?? ""} ${tc["@_name"] ?? ""}`.trim());
   const totalTests = totalAttr > 0 ? totalAttr : cases.length;
-  return {
-    totalTests,
-    passedTests: Math.max(0, totalTests - failedTests.length),
-    failedTests,
-  };
+  return { totalTests, passedTests: Math.max(0, totalTests - failedTests.length), failedTests };
 }
 
 export function tailLines(data: Buffer, n: number): string[] {
@@ -277,25 +253,11 @@ export function truncateMarkdown(s: string, maxLen = MAX_CHECK_OUTPUT_LEN): stri
 
 function fencedBlock(raw: string): string {
   const content = truncateMarkdown(raw);
-  let maxTicks = 0,
-    maxTildes = 0,
-    curTicks = 0,
-    curTildes = 0;
-  for (let i = 0; i < content.length; i++) {
-    const ch = content[i];
-    if (ch === "`") {
-      maxTicks = Math.max(maxTicks, ++curTicks);
-      curTildes = 0;
-    } else if (ch === "~") {
-      maxTildes = Math.max(maxTildes, ++curTildes);
-      curTicks = 0;
-    } else {
-      curTicks = curTildes = 0;
-    }
-  }
-  const tickLen = Math.max(3, maxTicks + 1);
-  const tildeLen = Math.max(3, maxTildes + 1);
-  const fence = tildeLen < tickLen ? "~".repeat(tildeLen) : "`".repeat(tickLen);
+  const maxRun = (ch: string) =>
+    Math.max(0, ...(content.match(new RegExp(`\\${ch}+`, "g")) ?? []).map((m) => m.length));
+  const ticks = Math.max(3, maxRun("`") + 1);
+  const tildes = Math.max(3, maxRun("~") + 1);
+  const fence = tildes < ticks ? "~".repeat(tildes) : "`".repeat(ticks);
   return `${fence}\n${content && !content.endsWith("\n") ? `${content}\n` : content}${fence}`;
 }
 
@@ -342,8 +304,9 @@ export function buildCheckOutput(
       : phones
           .map((p) => {
             const head = `### ${p.phoneName.replace(/\r?\n/g, " ")}\n\n`;
-            if (!p.junit)
+            if (!p.junit) {
               return `${head}The tests didn't run:\n\n${fencedBlock((p.outputTailLines ?? []).join("\n"))}\n`;
+            }
             const failed = p.junit.failedTests.length
               ? `\nFailed:\n\n${fencedBlock(p.junit.failedTests.join("\n"))}\n`
               : "";
@@ -351,9 +314,5 @@ export function buildCheckOutput(
           })
           .join("\n");
 
-  return {
-    title,
-    summary: truncateMarkdown(summary),
-    text: truncateMarkdown(text),
-  };
+  return { title, summary: truncateMarkdown(summary), text: truncateMarkdown(text) };
 }

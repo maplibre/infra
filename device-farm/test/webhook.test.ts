@@ -38,29 +38,34 @@ async function makeEvent(
 describe("webhook handler", () => {
   it("rejects invalid signatures and handles ping", async () => {
     const queued: JobMessage[] = [];
-    const deps = {
-      cfg: makeCfg(),
-      getWebhookSecret: async () => SECRET,
-      enqueue: async (m: JobMessage) => void queued.push(m),
-    };
+    const cfg = makeCfg();
+    const getSecret = async () => SECRET;
+    const enqueue = async (m: JobMessage) => void queued.push(m);
 
-    const bad = await handleWebhook(await makeEvent("ping", {}, "sha256=deadbeef"), deps);
+    const bad = await handleWebhook(
+      await makeEvent("ping", {}, "sha256=deadbeef"),
+      cfg,
+      getSecret,
+      enqueue,
+    );
     assert.equal(bad.statusCode, 401);
 
-    const pong = await handleWebhook(await makeEvent("ping", { zen: "hi" }), deps);
+    const pong = await handleWebhook(
+      await makeEvent("ping", { zen: "hi" }),
+      cfg,
+      getSecret,
+      enqueue,
+    );
     assert.equal(pong.statusCode, 200);
     assert.equal(queued.length, 0);
   });
 
   it("enqueues workflow_job completed, workflow_run completed, and check_run rerequested", async () => {
     const queued: JobMessage[] = [];
-    const deps = {
-      cfg: makeCfg(),
-      getWebhookSecret: async () => SECRET,
-      enqueue: async (m: JobMessage) => void queued.push(m),
-    };
+    const cfg = makeCfg();
+    const getSecret = async () => SECRET;
+    const enqueue = async (m: JobMessage) => void queued.push(m);
 
-    // Ignored: workflow_job in_progress
     const inProg = await handleWebhook(
       await makeEvent("workflow_job", {
         action: "in_progress",
@@ -73,12 +78,13 @@ describe("webhook handler", () => {
           head_sha: "abc",
         },
       }),
-      deps,
+      cfg,
+      getSecret,
+      enqueue,
     );
     assert.equal(inProg.statusCode, 200);
     assert.equal(queued.length, 0);
 
-    // Accepted: workflow_job completed
     const jobDone = await handleWebhook(
       await makeEvent("workflow_job", {
         action: "completed",
@@ -94,12 +100,13 @@ describe("webhook handler", () => {
           conclusion: "success",
         },
       }),
-      deps,
+      cfg,
+      getSecret,
+      enqueue,
     );
     assert.equal(jobDone.statusCode, 202);
     assert.equal(queued[0]?.workflowRunAttempt, 2);
 
-    // Accepted: check_run rerequested
     const rerun = await handleWebhook(
       await makeEvent("check_run", {
         action: "rerequested",
@@ -112,7 +119,9 @@ describe("webhook handler", () => {
           external_id: "10:2",
         },
       }),
-      deps,
+      cfg,
+      getSecret,
+      enqueue,
     );
     assert.equal(rerun.statusCode, 202);
     assert.equal(queued[1]?.externalId, "10:2");
@@ -120,11 +129,6 @@ describe("webhook handler", () => {
 
   it("filters branches when ALLOWED_BRANCHES is set", async () => {
     const queued: JobMessage[] = [];
-    const deps = {
-      cfg: makeCfg("ci/device-farm-lambda"),
-      getWebhookSecret: async () => SECRET,
-      enqueue: async (m: JobMessage) => void queued.push(m),
-    };
     const res = await handleWebhook(
       await makeEvent("workflow_job", {
         action: "completed",
@@ -139,7 +143,9 @@ describe("webhook handler", () => {
           conclusion: "success",
         },
       }),
-      deps,
+      makeCfg("ci/device-farm-lambda"),
+      async () => SECRET,
+      async (m) => void queued.push(m),
     );
     assert.equal(res.statusCode, 200);
     assert.equal(queued.length, 0);

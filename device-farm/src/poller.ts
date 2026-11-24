@@ -11,7 +11,7 @@ import {
 } from "@aws-sdk/client-device-farm";
 import { PutObjectCommand, type S3Client } from "@aws-sdk/client-s3";
 import type { Octokit } from "octokit";
-import { type Config, isDeviceFarmArn, lookupRepo, type RunRecord } from "./config.js";
+import { type Config, lookupRepo, type RunRecord } from "./config.js";
 import {
   buildCheckOutput,
   consoleUrl,
@@ -31,69 +31,63 @@ import type { RunStore } from "./store.js";
 const MAX_OUTPUT_BYTES = 64 << 20;
 const MAX_ARTIFACT_BYTES = 256 << 20;
 
-export interface PollerDeps {
-  cfg: Config;
-  store: RunStore;
-  df: Pick<DeviceFarmClient, "send">;
-  s3: Pick<S3Client, "send">;
-  getOctokit: (installationId: number) => Promise<Octokit>;
-  downloadToFile?: (url: string, dstPath: string, maxBytes: number) => Promise<void>;
-  now?: () => Date;
-}
-
-export async function handlePollerEvent(deps: PollerDeps): Promise<void> {
-  const active = await deps.store.queryActiveRuns();
-  if (active.length === 0) return;
-
+export async function handlePollerEvent(
+  cfg: Config,
+  store: RunStore,
+  df: DeviceFarmClient,
+  s3: S3Client,
+  getOctokit: (installationId: number) => Promise<Octokit>,
+): Promise<void> {
   const errs: unknown[] = [];
-  for (const rec of active) {
-    if (!isDeviceFarmArn(rec.run_arn)) continue;
+  for (const rec of await store.queryActiveRuns()) {
     try {
-      await pollRun(rec, deps);
+      await pollRun(rec, cfg, store, df, s3, getOctokit);
     } catch (err) {
       console.error("poller failed run", rec.run_arn, err);
       errs.push(err);
     }
   }
-  if (errs.length > 0)
+  if (errs.length > 0) {
     throw new AggregateError(errs, `${errs.length} active run(s) failed polling`);
+  }
 }
 
-const isNotFound = (err: unknown) =>
-  err instanceof NotFoundException ||
-  (typeof err === "object" &&
-    err !== null &&
-    (err as { name?: string }).name === "NotFoundException");
-
-async function pollRun(rec: RunRecord, deps: PollerDeps): Promise<void> {
-  const now = () => (deps.now ? deps.now() : new Date());
+async function pollRun(
+  rec: RunRecord,
+  cfg: Config,
+  store: RunStore,
+  df: DeviceFarmClient,
+  s3: S3Client,
+  getOctokit: (installationId: number) => Promise<Octokit>,
+): Promise<void> {
   let run;
   try {
-    run = (await deps.df.send(new GetRunCommand({ arn: rec.run_arn }))).run;
+    run = (await df.send(new GetRunCommand({ arn: rec.run_arn }))).run;
   } catch (err) {
-    if (isNotFound(err)) {
-      await deps.store.markCompleted(rec.run_arn, "NOT_FOUND", now());
+    if (
+      err instanceof NotFoundException ||
+      (err as { name?: string })?.name === "NotFoundException"
+    ) {
+      await store.markCompleted(rec.run_arn, "NOT_FOUND");
       return;
     }
     throw err;
   }
-  if (!run) return void (await deps.store.markCompleted(rec.run_arn, "NOT_FOUND", now()));
+  if (!run) return void (await store.markCompleted(rec.run_arn, "NOT_FOUND"));
   if (run.status !== "COMPLETED") return;
 
-  const repo = lookupRepo(deps.cfg, rec.repo ?? "");
-  if (!repo)
-    return void (await deps.store.markCompleted(rec.run_arn, run.result ?? "UNKNOWN", now()));
+  const repo = lookupRepo(cfg, rec.repo);
+  if (!repo) return void (await store.markCompleted(rec.run_arn, run.result ?? "UNKNOWN"));
 
-  const download = deps.downloadToFile ?? downloadStreamToFile;
   const putS3 = (
     key: string,
     body: Buffer | ReturnType<typeof createReadStream>,
     contentType: string,
     filename: string,
   ) =>
-    deps.s3.send(
+    s3.send(
       new PutObjectCommand({
-        Bucket: deps.cfg.resultsBucketName,
+        Bucket: cfg.resultsBucketName,
         Key: key,
         Body: body,
         ContentType: contentType,
@@ -101,17 +95,22 @@ async function pollRun(rec: RunRecord, deps: PollerDeps): Promise<void> {
       }),
     );
 
+  const tryDownload = async (url: string, dst: string, maxBytes: number, label: string) => {
+    try {
+      await downloadStreamToFile(url, dst, maxBytes);
+      return true;
+    } catch (err) {
+      console.warn(`failed to download ${label}`, err);
+      return false;
+    }
+  };
+
   const dir = await mkdtemp(join(tmpdir(), "device-farm-poller-"));
   try {
-    const jobs: Array<{
-      arn: string;
-      name: string;
-      result: string;
-      minutes: number;
-    }> = [];
+    const jobs: Array<{ arn: string; name: string; result: string; minutes: number }> = [];
     let nextToken: string | undefined;
     do {
-      const out = await deps.df.send(new ListJobsCommand({ arn: rec.run_arn, nextToken }));
+      const out = await df.send(new ListJobsCommand({ arn: rec.run_arn, nextToken }));
       for (const j of out.jobs ?? []) {
         jobs.push({
           arn: j.arn ?? "",
@@ -122,9 +121,7 @@ async function pollRun(rec: RunRecord, deps: PollerDeps): Promise<void> {
       }
       nextToken = out.nextToken;
     } while (nextToken);
-    jobs.sort((a, b) =>
-      a.name !== b.name ? a.name.localeCompare(b.name) : a.arn.localeCompare(b.arn),
-    );
+    jobs.sort((a, b) => a.name.localeCompare(b.name) || a.arn.localeCompare(b.arn));
 
     const runId = runIdFromArn(rec.run_arn);
     const slugCounts = new Map<string, number>();
@@ -149,14 +146,10 @@ async function pollRun(rec: RunRecord, deps: PollerDeps): Promise<void> {
       const artifacts: Array<{ type?: string; url?: string }> = [];
       let artToken: string | undefined;
       do {
-        const res = await deps.df.send(
-          new ListArtifactsCommand({
-            arn: job.arn,
-            type: "FILE",
-            nextToken: artToken,
-          }),
+        const res = await df.send(
+          new ListArtifactsCommand({ arn: job.arn, type: "FILE", nextToken: artToken }),
         );
-        for (const a of res.artifacts ?? []) artifacts.push({ type: a.type, url: a.url });
+        artifacts.push(...(res.artifacts ?? []).map((a) => ({ type: a.type, url: a.url })));
         artToken = res.nextToken;
       } while (artToken);
 
@@ -164,57 +157,36 @@ async function pollRun(rec: RunRecord, deps: PollerDeps): Promise<void> {
       const artifactUrl = artifacts.find((a) => a.type === "CUSTOMER_ARTIFACT" && a.url)?.url;
 
       let testspecBytes: Buffer = Buffer.alloc(0);
-      if (outputUrl) {
-        const outPath = join(phoneDir, "TESTSPEC_OUTPUT.txt");
-        let downloaded = false;
-        try {
-          await download(outputUrl, outPath, MAX_OUTPUT_BYTES);
-          downloaded = true;
-        } catch (err) {
-          console.warn("failed to download TESTSPEC_OUTPUT", job.name, err);
-        }
-        if (downloaded) {
-          const key = `${keyPrefix}/TESTSPEC_OUTPUT.txt`;
-          await putS3(
-            key,
-            createReadStream(outPath),
-            "text/plain; charset=utf-8",
-            "TESTSPEC_OUTPUT.txt",
-          );
-          pr.outputUrl = `${deps.cfg.resultsBaseUrl}/${key}`;
-          testspecBytes = await readFile(outPath);
-        }
+      const outPath = join(phoneDir, "TESTSPEC_OUTPUT.txt");
+      if (outputUrl && (await tryDownload(outputUrl, outPath, MAX_OUTPUT_BYTES, job.name))) {
+        const key = `${keyPrefix}/TESTSPEC_OUTPUT.txt`;
+        await putS3(
+          key,
+          createReadStream(outPath),
+          "text/plain; charset=utf-8",
+          "TESTSPEC_OUTPUT.txt",
+        );
+        pr.outputUrl = `${cfg.resultsBaseUrl}/${key}`;
+        testspecBytes = await readFile(outPath);
       }
 
-      if (artifactUrl) {
-        const zipPath = join(phoneDir, "CUSTOMER_ARTIFACT.zip");
-        let downloaded = false;
-        try {
-          await download(artifactUrl, zipPath, MAX_ARTIFACT_BYTES);
-          downloaded = true;
-        } catch (err) {
-          console.warn("failed to download CUSTOMER_ARTIFACT", job.name, err);
-        }
-        if (downloaded) {
-          const key = `${keyPrefix}/CUSTOMER_ARTIFACT.zip`;
-          await putS3(key, createReadStream(zipPath), "application/zip", "CUSTOMER_ARTIFACT.zip");
-          pr.artifactUrl = `${deps.cfg.resultsBaseUrl}/${key}`;
+      const zipPath = join(phoneDir, "CUSTOMER_ARTIFACT.zip");
+      if (artifactUrl && (await tryDownload(artifactUrl, zipPath, MAX_ARTIFACT_BYTES, job.name))) {
+        const key = `${keyPrefix}/CUSTOMER_ARTIFACT.zip`;
+        await putS3(key, createReadStream(zipPath), "application/zip", "CUSTOMER_ARTIFACT.zip");
+        pr.artifactUrl = `${cfg.resultsBaseUrl}/${key}`;
 
-          let junitRaw: Buffer | null = null;
+        const junitRaw = await extractJUnitFromZip(zipPath, DEFAULT_JUNIT_MAX_BYTES).catch(
+          (err) => (console.warn("failed to extract junit.xml", job.name, err), null),
+        );
+        if (junitRaw) {
+          const junitKey = `${keyPrefix}/junit.xml`;
+          await putS3(junitKey, junitRaw, "application/xml", "junit.xml");
+          pr.junitUrl = `${cfg.resultsBaseUrl}/${junitKey}`;
           try {
-            junitRaw = await extractJUnitFromZip(zipPath, DEFAULT_JUNIT_MAX_BYTES);
+            pr.junit = parseJUnit(junitRaw);
           } catch (err) {
-            console.warn("failed to extract junit.xml", job.name, err);
-          }
-          if (junitRaw) {
-            const junitKey = `${keyPrefix}/junit.xml`;
-            await putS3(junitKey, junitRaw, "application/xml", "junit.xml");
-            pr.junitUrl = `${deps.cfg.resultsBaseUrl}/${junitKey}`;
-            try {
-              pr.junit = parseJUnit(junitRaw);
-            } catch (err) {
-              console.warn("failed to parse junit.xml", job.name, err);
-            }
+            console.warn("failed to parse junit.xml", job.name, err);
           }
         }
       }
@@ -225,21 +197,20 @@ async function pollRun(rec: RunRecord, deps: PollerDeps): Promise<void> {
 
     const url = consoleUrl(rec.run_arn);
     const out = buildCheckOutput(run.result, url, phones);
-    const completedAt = now();
     if (rec.check_run_id && rec.installation_id) {
-      const gh = await deps.getOctokit(rec.installation_id);
+      const gh = await getOctokit(rec.installation_id);
       await gh.rest.checks.update({
         owner: repo.owner,
         repo: repo.name,
         check_run_id: rec.check_run_id,
         status: "completed",
         conclusion: mapRunResult(run.result),
-        completed_at: completedAt.toISOString(),
+        completed_at: new Date().toISOString(),
         details_url: url,
         output: { title: out.title, summary: out.summary, text: out.text },
       });
     }
-    await deps.store.markCompleted(rec.run_arn, run.result ?? "UNKNOWN", completedAt);
+    await store.markCompleted(rec.run_arn, run.result ?? "UNKNOWN");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

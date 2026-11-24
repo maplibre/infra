@@ -1,7 +1,6 @@
-import { ConditionalCheckFailedException } from "@aws-sdk/client-dynamodb";
+import { ConditionalCheckFailedException, DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import {
-  DeleteCommand,
-  type DynamoDBDocumentClient,
+  DynamoDBDocumentClient,
   PutCommand,
   QueryCommand,
   type QueryCommandInput,
@@ -9,104 +8,18 @@ import {
 } from "@aws-sdk/lib-dynamodb";
 import { repoShaKey, type RunRecord } from "./config.js";
 
-export const CLAIM_LEASE_SEC = 10 * 60;
 export const RECORD_TTL_SEC = 30 * 24 * 60 * 60;
 
-export interface RunStore {
-  claimWorkflowRun(claimKey: string, owner: string, now: Date): Promise<boolean>;
-  completeWorkflowClaim(claimKey: string, owner: string, now: Date): Promise<void>;
-  releaseWorkflowClaim(claimKey: string, owner: string): Promise<void>;
-  putRun(rec: RunRecord): Promise<void>;
-  queryActiveRuns(): Promise<RunRecord[]>;
-  queryActiveByBranch(branchKey: string): Promise<RunRecord[]>;
-  queryByRepoSha(repo: string, sha: string): Promise<RunRecord[]>;
-  markCompleted(runArn: string, result: string, now: Date): Promise<void>;
-}
+export class RunStore {
+  private readonly db: DynamoDBDocumentClient;
 
-const isConditionalFailed = (err: unknown): boolean =>
-  err instanceof ConditionalCheckFailedException ||
-  (typeof err === "object" &&
-    err !== null &&
-    "name" in err &&
-    (err as { name?: string }).name === "ConditionalCheckFailedException");
-
-export class DynamoRunStore implements RunStore {
   constructor(
-    private readonly db: DynamoDBDocumentClient,
+    region: string,
     private readonly tableName: string,
-  ) {}
-
-  async claimWorkflowRun(claimKey: string, owner: string, now: Date): Promise<boolean> {
-    const nowSec = Math.floor(now.getTime() / 1000);
-    const item: RunRecord = {
-      run_arn: claimKey,
-      state: "CLAIMING",
-      claim_owner: owner,
-      lease_expires_at: nowSec + CLAIM_LEASE_SEC,
-      created_at: now.toISOString(),
-      expires_at: nowSec + RECORD_TTL_SEC,
-    };
-    try {
-      await this.db.send(
-        new PutCommand({
-          TableName: this.tableName,
-          Item: item,
-          ConditionExpression:
-            "attribute_not_exists(run_arn) OR (#s = :claiming AND lease_expires_at < :now)",
-          ExpressionAttributeNames: { "#s": "state" },
-          ExpressionAttributeValues: {
-            ":claiming": "CLAIMING",
-            ":now": nowSec,
-          },
-        }),
-      );
-      return true;
-    } catch (err) {
-      if (isConditionalFailed(err)) return false;
-      throw err;
-    }
-  }
-
-  async completeWorkflowClaim(claimKey: string, owner: string, now: Date): Promise<void> {
-    const nowSec = Math.floor(now.getTime() / 1000);
-    try {
-      await this.db.send(
-        new UpdateCommand({
-          TableName: this.tableName,
-          Key: { run_arn: claimKey },
-          ConditionExpression: "#s = :claiming AND claim_owner = :owner",
-          UpdateExpression: "SET #s = :claimed, expires_at = :exp REMOVE lease_expires_at",
-          ExpressionAttributeNames: { "#s": "state" },
-          ExpressionAttributeValues: {
-            ":claiming": "CLAIMING",
-            ":claimed": "CLAIMED",
-            ":owner": owner,
-            ":exp": nowSec + RECORD_TTL_SEC,
-          },
-        }),
-      );
-    } catch (err) {
-      if (!isConditionalFailed(err)) throw err;
-    }
-  }
-
-  async releaseWorkflowClaim(claimKey: string, owner: string): Promise<void> {
-    try {
-      await this.db.send(
-        new DeleteCommand({
-          TableName: this.tableName,
-          Key: { run_arn: claimKey },
-          ConditionExpression: "#s = :claiming AND claim_owner = :owner",
-          ExpressionAttributeNames: { "#s": "state" },
-          ExpressionAttributeValues: {
-            ":claiming": "CLAIMING",
-            ":owner": owner,
-          },
-        }),
-      );
-    } catch (err) {
-      if (!isConditionalFailed(err)) throw err;
-    }
+  ) {
+    this.db = DynamoDBDocumentClient.from(new DynamoDBClient({ region }), {
+      marshallOptions: { removeUndefinedValues: true },
+    });
   }
 
   async putRun(rec: RunRecord): Promise<void> {
@@ -143,7 +56,7 @@ export class DynamoRunStore implements RunStore {
     });
   }
 
-  async markCompleted(runArn: string, result: string, now: Date): Promise<void> {
+  async markCompleted(runArn: string, result: string): Promise<void> {
     try {
       await this.db.send(
         new UpdateCommand({
@@ -156,12 +69,17 @@ export class DynamoRunStore implements RunStore {
             ":active": "ACTIVE",
             ":completed": "COMPLETED",
             ":result": result,
-            ":completedAt": now.toISOString(),
+            ":completedAt": new Date().toISOString(),
           },
         }),
       );
     } catch (err) {
-      if (!isConditionalFailed(err)) throw err;
+      if (
+        !(err instanceof ConditionalCheckFailedException) &&
+        (err as { name?: string })?.name !== "ConditionalCheckFailedException"
+      ) {
+        throw err;
+      }
     }
   }
 

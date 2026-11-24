@@ -1,5 +1,5 @@
-import { GetSecretValueCommand, type SecretsManagerClient } from "@aws-sdk/client-secrets-manager";
-import { App } from "octokit";
+import { GetSecretValueCommand, SecretsManagerClient } from "@aws-sdk/client-secrets-manager";
+import { App, type Octokit } from "octokit";
 
 export type Mode = "webhook" | "worker" | "poller";
 
@@ -39,16 +39,9 @@ export interface Config {
   repos: Map<string, RepoConfig>;
 }
 
-export interface AppCredentials {
-  app_id: string;
-  private_key_pem: string;
-  webhook_secret: string;
-}
-
 export interface JobMessage {
   event: "workflow_job" | "workflow_run" | "check_run";
   action: string;
-  deliveryId?: string;
   repo: string;
   installationId: number;
   headSha: string;
@@ -56,7 +49,6 @@ export interface JobMessage {
   headRepo?: string;
   workflowRunId?: number;
   workflowRunAttempt?: number;
-  workflowCreatedAt?: string;
   jobConclusion?: string;
   checkRunId?: number;
   externalId?: string;
@@ -64,48 +56,21 @@ export interface JobMessage {
 
 export interface RunRecord {
   run_arn: string;
-  state: "CLAIMING" | "CLAIMED" | "ACTIVE" | "COMPLETED";
+  state: "ACTIVE" | "COMPLETED";
   created_at: string;
-  branch_key?: string;
-  repo_sha?: string;
-  repo?: string;
-  sha?: string;
-  head_repo?: string;
-  head_branch?: string;
-  check_run_id?: number;
-  installation_id?: number;
-  workflow_run_id?: number;
-  workflow_run_attempt?: number;
-  workflow_created_at?: string;
-  rerun_delivery_id?: string;
-  claim_owner?: string;
-  lease_expires_at?: number;
+  branch_key: string;
+  repo_sha: string;
+  repo: string;
+  sha: string;
+  head_repo: string;
+  head_branch: string;
+  check_run_id: number;
+  installation_id: number;
+  workflow_run_id: number;
+  workflow_run_attempt: number;
   result?: string;
   completed_at?: string;
   expires_at: number;
-}
-
-export function defaultRepos(
-  mlnRsProjectArn = DEFAULT_MLN_RS_PROJECT_ARN,
-): Map<string, RepoConfig> {
-  const repos: RepoConfig[] = [
-    {
-      fullName: "maplibre/mln-rs",
-      owner: "maplibre",
-      name: "mln-rs",
-      defaultBranch: "main",
-      projectArn: mlnRsProjectArn,
-      workflowName: "ci",
-      triggerJob: "prepare-device-tests",
-      artifactName: "android-device-tests",
-      packageFilename: "android-tests.zip",
-      testSpecPath: "tools/device-farm/android.yml",
-      checkName: "device-test / android",
-      jobTimeoutMinutes: 60,
-      devices: [DEVICE_GOOGLE_PIXEL_9, DEVICE_SAMSUNG_GALAXY_S25],
-    },
-  ];
-  return new Map(repos.map((r) => [r.fullName.toLowerCase(), r]));
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -116,6 +81,22 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   const githubAppSecretArn = get("GITHUB_APP_SECRET_ARN");
   if (!githubAppSecretArn) throw new Error("GITHUB_APP_SECRET_ARN is required");
+
+  const mlnRs: RepoConfig = {
+    fullName: "maplibre/mln-rs",
+    owner: "maplibre",
+    name: "mln-rs",
+    defaultBranch: "main",
+    projectArn: get("MLN_RS_PROJECT_ARN") || DEFAULT_MLN_RS_PROJECT_ARN,
+    workflowName: "ci",
+    triggerJob: "prepare-device-tests",
+    artifactName: "android-device-tests",
+    packageFilename: "android-tests.zip",
+    testSpecPath: "tools/device-farm/android.yml",
+    checkName: "device-test / android",
+    jobTimeoutMinutes: 60,
+    devices: [DEVICE_GOOGLE_PIXEL_9, DEVICE_SAMSUNG_GALAXY_S25],
+  };
 
   const cfg: Config = {
     mode,
@@ -131,7 +112,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
         .map((s) => s.trim())
         .filter(Boolean),
     ),
-    repos: defaultRepos(get("MLN_RS_PROJECT_ARN") || DEFAULT_MLN_RS_PROJECT_ARN),
+    repos: new Map([[mlnRs.fullName, mlnRs]]),
   };
 
   if (mode === "webhook" && !cfg.jobsQueueUrl) throw new Error("JOBS_QUEUE_URL is required");
@@ -148,59 +129,46 @@ export const lookupRepo = (cfg: Config, fullName: string) =>
   cfg.repos.get(fullName.trim().toLowerCase());
 export const branchAllowed = (cfg: Config, branch?: string) =>
   cfg.allowedBranches.size === 0 || (Boolean(branch) && cfg.allowedBranches.has(branch!));
-export const isDeviceFarmArn = (arn: string) => arn.startsWith("arn:aws:devicefarm:");
-export const claimKey = (repo: string, runId: number, attempt: number) =>
-  `claim#${repo.toLowerCase()}#${runId}#${Math.max(1, attempt)}`;
-export const rerunClaimKey = (repo: string, deliveryId: string) =>
-  `claim-rerun#${repo.toLowerCase()}#${deliveryId}`;
 export const branchKey = (repo: string, headRepo: string, headBranch: string) =>
   `${repo.toLowerCase()}#${(headRepo || repo).toLowerCase()}#${headBranch}`;
 export const repoShaKey = (repo: string, sha: string) => `${repo.toLowerCase()}#${sha}`;
-
-export const formatExternalId = (runId: number, attempt: number, deliveryId?: string) =>
-  deliveryId
-    ? `${runId}:${Math.max(1, attempt)}:${deliveryId}`
-    : `${runId}:${Math.max(1, attempt)}`;
+export const formatExternalId = (runId: number, attempt: number) =>
+  `${runId}:${Math.max(1, attempt)}`;
 
 export function parseExternalId(raw?: string): { runId: number; attempt: number } | null {
   if (!raw) return null;
   const parts = raw.trim().split(":");
-  if (parts.length < 1 || parts.length > 3) return null;
+  if (parts.length < 1 || parts.length > 2) return null;
   const runId = Number(parts[0]);
-  if (!Number.isSafeInteger(runId) || runId <= 0) return null;
-  if (parts.length === 1) return { runId, attempt: 1 };
-  const attempt = Number(parts[1]);
-  if (!Number.isSafeInteger(attempt) || attempt <= 0) return null;
-  if (parts.length === 3 && !parts[2]) return null;
-  return { runId, attempt };
+  const attempt = parts.length === 2 ? Number(parts[1]) : 1;
+  return Number.isSafeInteger(runId) && runId > 0 && Number.isSafeInteger(attempt) && attempt > 0
+    ? { runId, attempt }
+    : null;
 }
 
-export function createCredentialsLoader(
-  sm: Pick<SecretsManagerClient, "send">,
-  secretArn: string,
-  ttlMs = 5 * 60 * 1000,
-): () => Promise<AppCredentials> {
-  let cached: { creds: AppCredentials; expiresAt: number } | null = null;
-  return async () => {
-    if (cached && Date.now() < cached.expiresAt) return cached.creds;
+export function createGitHubAuth(region: string, secretArn: string) {
+  const sm = new SecretsManagerClient({ region });
+  let cached: { secret: string; app: App; expiresAt: number } | null = null;
+
+  async function load() {
+    if (cached && Date.now() < cached.expiresAt) return cached;
     const out = await sm.send(new GetSecretValueCommand({ SecretId: secretArn }));
-    const parsed = JSON.parse(out.SecretString ?? "{}") as Partial<AppCredentials>;
-    if (!parsed.app_id || !parsed.private_key_pem || !parsed.webhook_secret) {
+    const { app_id, private_key_pem, webhook_secret } = JSON.parse(out.SecretString ?? "{}");
+    if (!app_id || !private_key_pem || !webhook_secret) {
       throw new Error("GitHub App secret must contain app_id, private_key_pem, and webhook_secret");
     }
-    const creds = {
-      app_id: String(parsed.app_id),
-      private_key_pem: parsed.private_key_pem,
-      webhook_secret: parsed.webhook_secret,
-    };
-    cached = { creds, expiresAt: Date.now() + ttlMs };
-    return creds;
+    const app = new App({
+      appId: String(app_id),
+      privateKey: private_key_pem,
+      webhooks: { secret: webhook_secret },
+    });
+    cached = { secret: webhook_secret, app, expiresAt: Date.now() + 5 * 60 * 1000 };
+    return cached;
+  }
+
+  return {
+    getWebhookSecret: async (): Promise<string> => (await load()).secret,
+    getOctokit: async (installationId: number): Promise<Octokit> =>
+      (await load()).app.getInstallationOctokit(installationId),
   };
 }
-
-export const createOctokitApp = (creds: AppCredentials) =>
-  new App({
-    appId: creds.app_id,
-    privateKey: creds.private_key_pem,
-    webhooks: { secret: creds.webhook_secret },
-  });
