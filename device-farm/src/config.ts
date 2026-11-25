@@ -313,11 +313,7 @@ export function parseRepoConfig(
     );
   }
 
-  // Until mln-rs's main moves to targets: its earlier single-target file, as one target.
-  const rawTargets =
-    doc.targets === undefined && doc.trigger_job !== undefined
-      ? { default: { ...doc, test_type: "APPIUM_WEB_NODE" } }
-      : doc.targets;
+  const rawTargets = doc.targets;
   if (!rawTargets || typeof rawTargets !== "object" || Array.isArray(rawTargets)) {
     throw new InvalidRepoConfigError(
       `${REPO_CONFIG_PATH}: "targets" must be a table of at least one target`,

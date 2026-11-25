@@ -183,10 +183,7 @@ devices = [
 ]
 ```
 
-The package and app are files at the root of the target's artifact. Until
-mln-rs's default branch moves to `targets`, a file without `targets` that has
-the earlier single-target keys at its top level is read as one `APPIUM_WEB_NODE`
-target named `default`.
+The package and app are files at the root of the target's artifact.
 
 ## Adding another repository (e.g. `maplibre/maplibre-native`)
 
