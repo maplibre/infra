@@ -28,6 +28,7 @@ import {
 } from "./config.js";
 import {
   consoleUrl,
+  DownloadSizeLimitError,
   downloadStreamToFile,
   extractPackageFromZip,
   InvalidArchiveError,
@@ -35,7 +36,7 @@ import {
 } from "./report.js";
 import { RECORD_TTL_SEC, type RunStore } from "./store.js";
 
-const MAX_ARTIFACT_ZIP_BYTES = 256 << 20;
+const MAX_ARTIFACT_ZIP_BYTES = 2 * 1024 * 1024 * 1024;
 
 class PermanentFailure extends Error {
   constructor(
@@ -85,7 +86,7 @@ async function uploadToDeviceFarm(
   });
   if (!put.ok) throw new Error(`Presigned upload PUT failed with HTTP ${put.status}`);
 
-  const deadline = Date.now() + 240_000;
+  const deadline = Date.now() + 600_000;
   while (true) {
     const out = await df.send(new GetUploadCommand({ arn: upload.arn }));
     if (out.upload?.status === "SUCCEEDED") return upload.arn;
@@ -255,7 +256,17 @@ async function processJob(
       }
 
       const outerZip = join(dir, "artifact.zip");
-      await downloadStreamToFile(loc, outerZip, MAX_ARTIFACT_ZIP_BYTES);
+      try {
+        await downloadStreamToFile(loc, outerZip, MAX_ARTIFACT_ZIP_BYTES);
+      } catch (err) {
+        if (err instanceof DownloadSizeLimitError) {
+          throw new PermanentFailure(
+            "Artifact too large",
+            `The CI artifact \`${repo.artifactName}\` exceeds the ${Math.round(MAX_ARTIFACT_ZIP_BYTES / (1024 * 1024))} MiB worker limit.`,
+          );
+        }
+        throw err;
+      }
 
       const pkgPath = join(dir, repo.packageFilename);
       try {

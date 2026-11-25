@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { createWriteStream } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -15,6 +17,8 @@ import {
   buildCheckOutput,
   consoleUrl,
   DEFAULT_JUNIT_MAX_BYTES,
+  DownloadSizeLimitError,
+  downloadStreamToFile,
   extractJUnitFromZip,
   extractPackageFromZip,
   InvalidArchiveError,
@@ -179,6 +183,36 @@ describe("ZIP extraction & bounds", () => {
       await writeFile(trunc, "PK\x05\x06short");
       await assert.rejects(() => extractJUnitFromZip(trunc), InvalidArchiveError);
     } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects oversized downloads with DownloadSizeLimitError via header or stream", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "df-dl-bounds-"));
+    const server = createServer((req, res) => {
+      const payload = Buffer.alloc(64, 0x61);
+      if (req.url === "/chunked") {
+        res.writeHead(200);
+        res.write(payload.subarray(0, 32));
+        res.end(payload.subarray(32));
+      } else {
+        res.writeHead(200, { "content-length": String(payload.length) });
+        res.end(payload);
+      }
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as AddressInfo;
+    try {
+      await assert.rejects(
+        () => downloadStreamToFile(`http://127.0.0.1:${port}/fixed`, join(dir, "a.bin"), 32),
+        DownloadSizeLimitError,
+      );
+      await assert.rejects(
+        () => downloadStreamToFile(`http://127.0.0.1:${port}/chunked`, join(dir, "b.bin"), 32),
+        DownloadSizeLimitError,
+      );
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
       await rm(dir, { recursive: true, force: true });
     }
   });
