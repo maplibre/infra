@@ -135,64 +135,71 @@ async function pollRun(
 
       const phoneDir = join(dir, slug);
       await mkdir(phoneDir, { recursive: true });
-      const keyPrefix = `${repo.name}/${rec.sha}/${runId}/${slug}`;
-      const pr: PhoneReport = {
-        phoneName: job.name,
-        phoneSlug: slug,
-        result: job.result,
-        deviceMinutes: job.minutes,
-      };
+      try {
+        const keyPrefix = `${repo.name}/${rec.sha}/${runId}/${slug}`;
+        const pr: PhoneReport = {
+          phoneName: job.name,
+          phoneSlug: slug,
+          result: job.result,
+          deviceMinutes: job.minutes,
+        };
 
-      const artifacts: Array<{ type?: string; url?: string }> = [];
-      let artToken: string | undefined;
-      do {
-        const res = await df.send(
-          new ListArtifactsCommand({ arn: job.arn, type: "FILE", nextToken: artToken }),
-        );
-        artifacts.push(...(res.artifacts ?? []).map((a) => ({ type: a.type, url: a.url })));
-        artToken = res.nextToken;
-      } while (artToken);
+        const artifacts: Array<{ type?: string; url?: string }> = [];
+        let artToken: string | undefined;
+        do {
+          const res = await df.send(
+            new ListArtifactsCommand({ arn: job.arn, type: "FILE", nextToken: artToken }),
+          );
+          artifacts.push(...(res.artifacts ?? []).map((a) => ({ type: a.type, url: a.url })));
+          artToken = res.nextToken;
+        } while (artToken);
 
-      const outputUrl = artifacts.find((a) => a.type === "TESTSPEC_OUTPUT" && a.url)?.url;
-      const artifactUrl = artifacts.find((a) => a.type === "CUSTOMER_ARTIFACT" && a.url)?.url;
+        const outputUrl = artifacts.find((a) => a.type === "TESTSPEC_OUTPUT" && a.url)?.url;
+        const artifactUrl = artifacts.find((a) => a.type === "CUSTOMER_ARTIFACT" && a.url)?.url;
 
-      let testspecBytes: Buffer = Buffer.alloc(0);
-      const outPath = join(phoneDir, "TESTSPEC_OUTPUT.txt");
-      if (outputUrl && (await tryDownload(outputUrl, outPath, MAX_OUTPUT_BYTES, job.name))) {
-        const key = `${keyPrefix}/TESTSPEC_OUTPUT.txt`;
-        await putS3(
-          key,
-          createReadStream(outPath),
-          "text/plain; charset=utf-8",
-          "TESTSPEC_OUTPUT.txt",
-        );
-        pr.outputUrl = `${cfg.resultsBaseUrl}/${key}`;
-        testspecBytes = await readFile(outPath);
-      }
+        let testspecBytes: Buffer = Buffer.alloc(0);
+        const outPath = join(phoneDir, "TESTSPEC_OUTPUT.txt");
+        if (outputUrl && (await tryDownload(outputUrl, outPath, MAX_OUTPUT_BYTES, job.name))) {
+          const key = `${keyPrefix}/TESTSPEC_OUTPUT.txt`;
+          await putS3(
+            key,
+            createReadStream(outPath),
+            "text/plain; charset=utf-8",
+            "TESTSPEC_OUTPUT.txt",
+          );
+          pr.outputUrl = `${cfg.resultsBaseUrl}/${key}`;
+          testspecBytes = await readFile(outPath);
+        }
 
-      const zipPath = join(phoneDir, "CUSTOMER_ARTIFACT.zip");
-      if (artifactUrl && (await tryDownload(artifactUrl, zipPath, MAX_ARTIFACT_BYTES, job.name))) {
-        const key = `${keyPrefix}/CUSTOMER_ARTIFACT.zip`;
-        await putS3(key, createReadStream(zipPath), "application/zip", "CUSTOMER_ARTIFACT.zip");
-        pr.artifactUrl = `${cfg.resultsBaseUrl}/${key}`;
+        const zipPath = join(phoneDir, "CUSTOMER_ARTIFACT.zip");
+        if (
+          artifactUrl &&
+          (await tryDownload(artifactUrl, zipPath, MAX_ARTIFACT_BYTES, job.name))
+        ) {
+          const key = `${keyPrefix}/CUSTOMER_ARTIFACT.zip`;
+          await putS3(key, createReadStream(zipPath), "application/zip", "CUSTOMER_ARTIFACT.zip");
+          pr.artifactUrl = `${cfg.resultsBaseUrl}/${key}`;
 
-        const junitRaw = await extractJUnitFromZip(zipPath, DEFAULT_JUNIT_MAX_BYTES).catch(
-          (err) => (console.warn("failed to extract junit.xml", job.name, err), null),
-        );
-        if (junitRaw) {
-          const junitKey = `${keyPrefix}/junit.xml`;
-          await putS3(junitKey, junitRaw, "application/xml", "junit.xml");
-          pr.junitUrl = `${cfg.resultsBaseUrl}/${junitKey}`;
-          try {
-            pr.junit = parseJUnit(junitRaw);
-          } catch (err) {
-            console.warn("failed to parse junit.xml", job.name, err);
+          const junitRaw = await extractJUnitFromZip(zipPath, DEFAULT_JUNIT_MAX_BYTES).catch(
+            (err) => (console.warn("failed to extract junit.xml", job.name, err), null),
+          );
+          if (junitRaw) {
+            const junitKey = `${keyPrefix}/junit.xml`;
+            await putS3(junitKey, junitRaw, "application/xml", "junit.xml");
+            pr.junitUrl = `${cfg.resultsBaseUrl}/${junitKey}`;
+            try {
+              pr.junit = parseJUnit(junitRaw);
+            } catch (err) {
+              console.warn("failed to parse junit.xml", job.name, err);
+            }
           }
         }
-      }
 
-      if (!pr.junit) pr.outputTailLines = tailLines(testspecBytes, DEFAULT_TAIL_LINES);
-      phones.push(pr);
+        if (!pr.junit) pr.outputTailLines = tailLines(testspecBytes, DEFAULT_TAIL_LINES);
+        phones.push(pr);
+      } finally {
+        await rm(phoneDir, { recursive: true, force: true });
+      }
     }
 
     const url = consoleUrl(rec.run_arn);
