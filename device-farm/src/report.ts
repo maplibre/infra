@@ -70,6 +70,13 @@ function byteLimit(maxBytes: number, onExceed: () => Error): Transform {
   });
 }
 
+export class DownloadSizeLimitError extends Error {
+  constructor(maxBytes: number) {
+    super(`Download exceeds max size ${maxBytes} bytes`);
+    this.name = "DownloadSizeLimitError";
+  }
+}
+
 export async function downloadStreamToFile(
   url: string,
   dstPath: string,
@@ -77,10 +84,15 @@ export async function downloadStreamToFile(
 ): Promise<void> {
   const resp = await fetch(url, { redirect: "follow" });
   if (!resp.ok || !resp.body) throw new Error(`Download failed with HTTP ${resp.status}`);
+  const contentLength = Number(resp.headers.get("content-length"));
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    await resp.body.cancel();
+    throw new DownloadSizeLimitError(maxBytes);
+  }
   try {
     await pipeline(
       Readable.fromWeb(resp.body as unknown as import("node:stream/web").ReadableStream),
-      byteLimit(maxBytes, () => new Error(`Download exceeds max size ${maxBytes} bytes`)),
+      byteLimit(maxBytes, () => new DownloadSizeLimitError(maxBytes)),
       createWriteStream(dstPath),
     );
   } catch (err) {

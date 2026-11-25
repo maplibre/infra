@@ -16,7 +16,7 @@ runs in three modes selected by the `MODE` environment variable:
    from the repository's default branch (cached for 60s) for relevant events
    (`workflow_job` `completed`, `workflow_run` `completed`, `check_run`
    `rerequested`), enqueues a compact JSON job onto SQS, and returns `202 Accepted`.
-2. **`worker`** (`1024 MB`, `2048 MB /tmp`, `300s` timeout, SQS trigger with
+2. **`worker`** (`1769 MB`, `5120 MB /tmp`, `900s` timeout, SQS trigger with
    `batch_size = 1` and `ReportBatchItemFailures`): authenticates as the GitHub App
    installation, loads `.config/device-farm.toml` from the repository's default
    branch, deduplicates against existing DynamoDB runs, stops any earlier `ACTIVE`

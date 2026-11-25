@@ -123,7 +123,7 @@ resource "aws_sqs_queue" "jobs_dlq" {
 
 resource "aws_sqs_queue" "jobs" {
   name                       = "${local.name_prefix}-jobs"
-  visibility_timeout_seconds = 360
+  visibility_timeout_seconds = 960
   message_retention_seconds  = 345600
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.jobs_dlq.arn
@@ -413,11 +413,11 @@ resource "aws_lambda_function" "worker" {
   handler          = "index.handler"
   filename         = local.lambda_zip_path
   source_code_hash = local.lambda_source_hash
-  memory_size      = 1024
-  timeout          = 300
+  memory_size      = 1769
+  timeout          = 900
 
   ephemeral_storage {
-    size = 2048
+    size = 5120
   }
 
   environment {
