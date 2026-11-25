@@ -97,24 +97,9 @@ describe("config & helpers", () => {
     assert.equal(defaults.pullRequests, true);
     assert.equal(defaults.billingMethod, "METERED");
 
-    // The single-target file that predates targets.
-    const legacy = parseRepoConfig(
-      `workflow_name = "ci"
-      trigger_job = "prepare-device-tests"
-      artifact_name = "android-device-tests"
-      package_filename = "android-tests.zip"
-      test_spec_path = "tools/device-farm/android.yml"
-      check_name = "device-test / android"
-      devices = ["arn:aws:devicefarm:us-west-2::device:1"]`,
-      meta,
-    );
-    assert.deepEqual(
-      legacy.targets.map((t) => [t.name, t.triggerJob, t.testType]),
-      [["default", "prepare-device-tests", "APPIUM_WEB_NODE"]],
-    );
-
     for (const bad of [
       `workflow_name = "ci"`,
+      `workflow_name = "ci"\n${android}`,
       `workflow_name = "ci"\n[targets.android]\n${android.replace("tests.zip", "../evil.zip")}`,
       `workflow_name = "ci"\n[targets.android]\n${android}\njob_timeout_minutes = 999`,
       `workflow_name = "ci"\n[targets.android]\n${android.replace("APPIUM_WEB_NODE", "XCTEST")}`,
