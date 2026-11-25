@@ -20,13 +20,33 @@ const SAMPLE_REPO: RepoConfig = {
   defaultBranch: "main",
   projectArn: PROJECT_ARN,
   workflowName: "ci",
-  triggerJob: "prepare-device-tests",
-  artifactName: "android-device-tests",
-  packageFilename: "android-tests.zip",
-  testSpecPath: "tools/device-farm/android.yml",
-  checkName: "device-test / android",
-  jobTimeoutMinutes: 60,
-  devices: ["arn:aws:devicefarm:us-west-2::device:6D89F408709B4D3BBBBB17696A24B141"],
+  pullRequests: false,
+  billingMethod: "UNMETERED",
+  targets: [
+    {
+      name: "android",
+      triggerJob: "prepare-android-device-tests",
+      artifactName: "android-device-tests",
+      testType: "APPIUM_WEB_NODE",
+      packageFilename: "tests.zip",
+      testSpecPath: "tools/device-farm/android/test-spec.yml",
+      checkName: "device-test / android",
+      jobTimeoutMinutes: 60,
+      devices: ["arn:aws:devicefarm:us-west-2::device:6D89F408709B4D3BBBBB17696A24B141"],
+    },
+    {
+      name: "ios",
+      triggerJob: "prepare-ios-device-tests",
+      artifactName: "ios-device-tests",
+      testType: "APPIUM_NODE",
+      packageFilename: "tests.zip",
+      appFilename: "app.ipa",
+      testSpecPath: "tools/device-farm/ios/test-spec.yml",
+      checkName: "device-test / ios",
+      jobTimeoutMinutes: 60,
+      devices: ["arn:aws:devicefarm:us-west-2::device:6200F380A4874FEB9C72EED72B863B67"],
+    },
+  ],
 };
 
 const loadSample: RepoConfigLoader = async () => SAMPLE_REPO;
@@ -105,7 +125,7 @@ describe("webhook handler", () => {
         repository: { full_name: "maplibre/mln-rs", default_branch: "main" },
         installation: { id: 99 },
         workflow_job: {
-          name: "prepare-device-tests",
+          name: "prepare-android-device-tests",
           workflow_name: "ci",
           run_id: 10,
           head_sha: "abc",
@@ -125,7 +145,7 @@ describe("webhook handler", () => {
         repository: { full_name: "maplibre/mln-rs", default_branch: "main" },
         installation: { id: 99 },
         workflow_job: {
-          name: "prepare-device-tests",
+          name: "prepare-android-device-tests",
           workflow_name: "ci",
           run_id: 10,
           run_attempt: 2,
@@ -142,6 +162,28 @@ describe("webhook handler", () => {
     assert.equal(jobDone.statusCode, 202);
     assert.equal(queued[0]?.workflowRunAttempt, 2);
     assert.equal(queued[0]?.defaultBranch, "main");
+    assert.equal(queued[0]?.target, "android");
+
+    const otherJob = await handleWebhook(
+      await makeEvent("workflow_job", {
+        action: "completed",
+        repository: { full_name: "maplibre/mln-rs", default_branch: "main" },
+        installation: { id: 99 },
+        workflow_job: {
+          name: "target (android)",
+          workflow_name: "ci",
+          run_id: 10,
+          head_sha: "abc123",
+          conclusion: "success",
+        },
+      }),
+      cfg,
+      getSecret,
+      loader,
+      enqueue,
+    );
+    assert.equal(otherJob.statusCode, 200);
+    assert.equal(queued.length, 1);
 
     const rerun = await handleWebhook(
       await makeEvent("check_run", {
@@ -150,7 +192,7 @@ describe("webhook handler", () => {
         installation: { id: 99 },
         check_run: {
           id: 50,
-          name: "device-test / android",
+          name: "device-test / ios",
           head_sha: "abc123",
           external_id: "10:2",
         },
@@ -162,6 +204,7 @@ describe("webhook handler", () => {
     );
     assert.equal(rerun.statusCode, 202);
     assert.equal(queued[1]?.externalId, "10:2");
+    assert.equal(queued[1]?.target, "ios");
   });
 
   it("handles missing or invalid .config/device-farm.toml and ALLOWED_BRANCHES", async () => {
@@ -171,7 +214,7 @@ describe("webhook handler", () => {
       repository: { full_name: "maplibre/mln-rs", default_branch: "main" },
       installation: { id: 99 },
       workflow_job: {
-        name: "prepare-device-tests",
+        name: "prepare-android-device-tests",
         workflow_name: "ci",
         run_id: 10,
         head_sha: "abc",

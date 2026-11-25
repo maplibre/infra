@@ -1,8 +1,9 @@
 # AWS Device Farm Orchestrator
 
 A serverless TypeScript Lambda orchestrator in `us-west-2` that bridges GitHub Actions CI
-builds to AWS Device Farm hardware runs and reports results back as a GitHub Check
-Run (`device-test / android`). The OpenTofu stack lives in
+builds to AWS Device Farm hardware runs and reports each one's results back as a
+GitHub Check Run (such as `device-test / android`). A repository configures one or
+more targets, each a CI job's test package and the devices it runs on. The OpenTofu stack lives in
 [`../opentofu/device-farm/`](../opentofu/README.md).
 
 ## Architecture
@@ -19,13 +20,15 @@ runs in three modes selected by the `MODE` environment variable:
 2. **`worker`** (`1769 MB`, `5120 MB /tmp`, `900s` timeout, SQS trigger with
    `batch_size = 1` and `ReportBatchItemFailures`): authenticates as the GitHub App
    installation, loads `.config/device-farm.toml` from the repository's default
-   branch, deduplicates against existing DynamoDB runs, stops any earlier `ACTIVE`
-   runs on the same `(repo, head_repo, head_branch)`, downloads the configured
-   Actions artifact without leaking the GitHub `Authorization` header to Azure Blob
-   Storage, extracts the configured test package without unpacking or executing its
-   contents, fetches the configured test spec from the default branch (never from a
-   PR branch), uploads both to Device Farm, schedules the run, and records it in
-   DynamoDB.
+   branch, passes a pull request's check as not needed when the repository runs
+   only its default branch's commits, deduplicates against existing DynamoDB runs,
+   stops any earlier `ACTIVE` runs of the target on the same
+   `(repo, head_repo, head_branch)` other than the default branch, downloads the
+   target's Actions artifact without leaking the GitHub `Authorization` header to
+   Azure Blob Storage, extracts the test package (and app, if any) without
+   unpacking or executing their contents, fetches the test spec from the default
+   branch (never from a PR branch), uploads them to Device Farm, schedules the run
+   with the repository's billing method, and records it in DynamoDB.
 3. **`poller`** (`512 MB`, `1024 MB /tmp`, `120s` timeout, EventBridge `rate(1 minute)`):
    queries DynamoDB `state-index` for `ACTIVE` runs (exiting immediately when idle),
    checks `devicefarm:GetRun`, downloads `TESTSPEC_OUTPUT` and `CUSTOMER_ARTIFACT`
@@ -137,8 +140,8 @@ Once verified, cut over all branches by clearing `allowed_branches`:
 allowed_branches = ""
 ```
 
-Then run `just device-farm::plan` and `just device-farm::apply`, and add
-`device-test / android` to branch protection when ready.
+Then run `just device-farm::plan` and `just device-farm::apply`, and add the
+targets' check names to branch protection when ready.
 
 ## Repository configuration (`.config/device-farm.toml`)
 
@@ -147,17 +150,43 @@ default branch (always read from the default branch, never from a PR branch):
 
 ```toml
 workflow_name = "ci"
-trigger_job = "prepare-device-tests"
+# Optional (default true). When false, only pushes run on the devices, and pull
+# requests' checks pass as not needed.
+pull_requests = false
+# Optional (default "METERED"). "UNMETERED" runs on the account's flat-rate devices.
+billing_method = "UNMETERED"
+
+# Each target is a job of the workflow whose artifact holds a test package.
+[targets.android]
+trigger_job = "prepare-android-device-tests"
 artifact_name = "android-device-tests"
-package_filename = "android-tests.zip"
-test_spec_path = "tools/device-farm/android.yml"
 check_name = "device-test / android"
-job_timeout_minutes = 60
+# APPIUM_WEB_NODE needs no app; APPIUM_NODE installs app_filename (.apk or .ipa).
+test_type = "APPIUM_WEB_NODE"
+package_filename = "tests.zip"
+test_spec_path = "tools/device-farm/android/test-spec.yml"
+job_timeout_minutes = 60 # optional, at most 90
 devices = [
   "arn:aws:devicefarm:us-west-2::device:6D89F408709B4D3BBBBB17696A24B141", # Google Pixel 9
-  "arn:aws:devicefarm:us-west-2::device:092D78E7B4694568812D5FF0711CD346", # Samsung Galaxy S25
+]
+
+[targets.ios]
+trigger_job = "prepare-ios-device-tests"
+artifact_name = "ios-device-tests"
+check_name = "device-test / ios"
+test_type = "APPIUM_NODE"
+package_filename = "tests.zip"
+app_filename = "app.ipa"
+test_spec_path = "tools/device-farm/ios/test-spec.yml"
+devices = [
+  "arn:aws:devicefarm:us-west-2::device:6200F380A4874FEB9C72EED72B863B67", # Apple iPhone 17 Pro
 ]
 ```
+
+The package and app are files at the root of the target's artifact. Until
+mln-rs's default branch moves to `targets`, a file without `targets` that has
+the earlier single-target keys at its top level is read as one `APPIUM_WEB_NODE`
+target named `default`.
 
 ## Adding another repository (e.g. `maplibre/maplibre-native`)
 

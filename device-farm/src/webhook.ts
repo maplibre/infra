@@ -3,6 +3,8 @@ import type { APIGatewayProxyEventV2, APIGatewayProxyStructuredResultV2 } from "
 import {
   branchAllowed,
   type Config,
+  findTargetByCheck,
+  findTargetByJob,
   InvalidRepoConfigError,
   type JobMessage,
   lookupProjectArn,
@@ -94,8 +96,9 @@ export async function handleWebhook(
   let msg: JobMessage | null = null;
   if (eventType === "workflow_job") {
     const job = payload.workflow_job;
+    const target = findTargetByJob(repo, job?.name);
     if (
-      job?.name === repo.triggerJob &&
+      target &&
       (!job.workflow_name || job.workflow_name === repo.workflowName) &&
       job.run_id &&
       job.head_sha
@@ -104,6 +107,7 @@ export async function handleWebhook(
         event: "workflow_job",
         action: "completed",
         repo: repo.fullName,
+        target: target.name,
         defaultBranch: repo.defaultBranch,
         installationId,
         headSha: job.head_sha,
@@ -131,11 +135,13 @@ export async function handleWebhook(
     }
   } else if (eventType === "check_run") {
     const cr = payload.check_run;
-    if (cr?.name === repo.checkName && cr.id && cr.head_sha) {
+    const target = findTargetByCheck(repo, cr?.name);
+    if (target && cr.id && cr.head_sha) {
       msg = {
         event: "check_run",
         action: "rerequested",
         repo: repo.fullName,
+        target: target.name,
         defaultBranch: repo.defaultBranch,
         installationId,
         headSha: cr.head_sha,
