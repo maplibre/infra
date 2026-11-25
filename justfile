@@ -2,6 +2,7 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 set positional-arguments
 
 mod ctcache 'ctcache/justfile'
+mod device-farm 'device-farm/justfile'
 mod forgejo 'forgejo/justfile'
 mod github-actions 'github-actions/justfile'
 
@@ -14,7 +15,7 @@ dev:
     nix develop ./ctcache/nix
 
 # Connect every stack to its S3 state key.
-init: ctcache::init forgejo::init github-actions::init
+init: ctcache::init device-farm::init forgejo::init github-actions::init
     tofu -chdir=opentofu/bootstrap init
 
 # Plan changes to the shared state bucket.
@@ -35,11 +36,11 @@ bootstrap-migrate:
     mv opentofu/bootstrap/backend.tf.disabled opentofu/bootstrap/backend.tf
     tofu -chdir=opentofu/bootstrap init -migrate-state
 
-# Format the infrastructure and the Nix configurations.
-fmt: ctcache::fmt forgejo::fmt
+# Format the infrastructure, TypeScript, and Nix configurations.
+fmt: ctcache::fmt device-farm::fmt forgejo::fmt
     tofu fmt -recursive opentofu
 
 # Check configuration and synchronization scripts without changing infrastructure.
-check: ctcache::check forgejo::check github-actions::check
+check: ctcache::check device-farm::check forgejo::check github-actions::check
     tofu fmt -check -recursive opentofu
     tofu -chdir=opentofu/bootstrap validate

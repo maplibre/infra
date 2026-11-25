@@ -1,0 +1,54 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+set positional-arguments
+
+stack := source_directory() / "../opentofu/device-farm"
+
+# List Device Farm orchestrator build and deployment commands.
+default:
+    @just --list
+
+# Install npm dependencies.
+install:
+    npm ci
+
+# Format the TypeScript source files.
+fmt:
+    npm run fmt
+
+# Run formatting, TypeScript typecheck, unit tests, and OpenTofu validation without changing infrastructure.
+check:
+    npm run check
+    tofu -chdir="{{stack}}" validate
+
+# Bundle the TypeScript Lambda into build/lambda.zip (nodejs22.x arm64).
+build:
+    npm run build
+
+# Create local tfvars from the example.
+configure:
+    @if [[ ! -e "{{stack}}/terraform.tfvars" ]]; then cp "{{stack}}/terraform.tfvars.example" "{{stack}}/terraform.tfvars"; fi
+    @echo 'Edit {{stack}}/terraform.tfvars if you want to restrict allowed_branches.'
+
+# Connect to the Device Farm state in S3.
+init:
+    tofu -chdir="{{stack}}" init
+
+# Build the Lambda zip and save an OpenTofu plan; this does not deploy anything.
+plan: build
+    tofu -chdir="{{stack}}" plan -out=deploy.tfplan
+
+# Apply the previously saved plan.
+apply:
+    tofu -chdir="{{stack}}" apply deploy.tfplan
+
+# Print the deployment outputs.
+outputs:
+    tofu -chdir="{{stack}}" output
+
+# Print the GitHub App webhook URL.
+webhook-url:
+    @tofu -chdir="{{stack}}" output -raw webhook_url
+
+# Remove this stack; keep the shared state bucket and AWS Device Farm project.
+destroy:
+    tofu -chdir="{{stack}}" destroy
