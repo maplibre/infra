@@ -179,6 +179,8 @@ async function processJob(
     }
   };
 
+  const pullRequestsNotNeeded = `Pull requests don't run on the devices; \`${repo.defaultBranch}\`'s commits do.`;
+
   const scheduleRun = async (
     target: TargetConfig,
     workflowRunId: number,
@@ -197,13 +199,7 @@ async function processJob(
     const extId = formatExternalId(workflowRunId, runAttempt);
 
     if (!repo.pullRequests && isPullRequest(wfRun.event)) {
-      await settle(
-        target,
-        "success",
-        "Not needed",
-        `Pull requests don't run on the devices; \`${repo.defaultBranch}\`'s commits do.`,
-        { headSha, extId },
-      );
+      await settle(target, "success", "Not needed", pullRequestsNotNeeded, { headSha, extId });
       return;
     }
 
@@ -450,6 +446,12 @@ async function processJob(
         `CI skipped \`${target.triggerJob}\`, so this change needs no device tests.`,
         { extId },
       );
+    } else if (
+      !repo.pullRequests &&
+      isPullRequest((await gh.rest.actions.getWorkflowRun({ ...base, run_id: runId })).data.event)
+    ) {
+      // The pull request's own CI reports its failed build.
+      await settle(target, "success", "Not needed", pullRequestsNotNeeded, { extId });
     } else {
       await settle(
         target,
