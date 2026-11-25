@@ -19,12 +19,15 @@ import {
   branchKey,
   type Config,
   fetchRepoConfig,
+  findTargetByName,
   formatExternalId,
   InvalidRepoConfigError,
   type JobMessage,
   lookupProjectArn,
   parseExternalId,
+  type RepoConfig,
   repoShaKey,
+  type TargetConfig,
 } from "./config.js";
 import {
   consoleUrl,
@@ -115,6 +118,12 @@ async function stopRun(df: DeviceFarmClient, arn: string) {
   }
 }
 
+const appUploadType = (filename: string): UploadType =>
+  filename.endsWith(".ipa") ? "IOS_APP" : "ANDROID_APP";
+
+const isPullRequest = (event?: string) =>
+  event === "pull_request" || event === "pull_request_target";
+
 async function processJob(
   msg: JobMessage,
   cfg: Config,
@@ -125,7 +134,7 @@ async function processJob(
   const projectArn = lookupProjectArn(cfg, msg.repo);
   if (!projectArn) return;
   const gh = await getOctokit(msg.installationId);
-  let repo;
+  let repo: RepoConfig | null;
   try {
     repo = await fetchRepoConfig(gh, msg.repo, msg.defaultBranch || "main", projectArn);
   } catch (err) {
@@ -139,6 +148,7 @@ async function processJob(
   const base = { owner: repo.owner, repo: repo.name };
 
   const settle = async (
+    target: TargetConfig,
     conclusion: "success" | "failure",
     title: string,
     summary: string,
@@ -158,7 +168,7 @@ async function processJob(
     } else {
       await gh.rest.checks.create({
         ...base,
-        name: repo.checkName,
+        name: target.checkName,
         head_sha: opts.headSha ?? msg.headSha,
         external_id: opts.extId,
         status: "completed",
@@ -169,7 +179,12 @@ async function processJob(
     }
   };
 
-  const scheduleRun = async (workflowRunId: number, requestedAttempt: number, isRerun: boolean) => {
+  const scheduleRun = async (
+    target: TargetConfig,
+    workflowRunId: number,
+    requestedAttempt: number,
+    isRerun: boolean,
+  ) => {
     const { data: wfRun } = await gh.rest.actions.getWorkflowRun({
       ...base,
       run_id: workflowRunId,
@@ -179,22 +194,36 @@ async function processJob(
     const headRepo = msg.headRepo || wfRun.head_repository?.full_name || repo.fullName;
     const runAttempt = Math.max(1, requestedAttempt || wfRun.run_attempt || 1);
     if (headBranch && !branchAllowed(cfg, headBranch)) return;
+    const extId = formatExternalId(workflowRunId, runAttempt);
+
+    if (!repo.pullRequests && isPullRequest(wfRun.event)) {
+      await settle(
+        target,
+        "success",
+        "Not needed",
+        `Pull requests don't run on the devices; \`${repo.defaultBranch}\`'s commits do.`,
+        { headSha, extId },
+      );
+      return;
+    }
 
     if (!isRerun) {
       const existing = await store.queryByRepoSha(repo.fullName, headSha);
       if (
         existing.some(
-          (r) => r.workflow_run_id === workflowRunId && r.workflow_run_attempt === runAttempt,
+          (r) =>
+            r.target === target.name &&
+            r.workflow_run_id === workflowRunId &&
+            r.workflow_run_attempt === runAttempt,
         )
       ) {
         return;
       }
     }
 
-    const extId = formatExternalId(workflowRunId, runAttempt);
     const { data: created } = await gh.rest.checks.create({
       ...base,
-      name: repo.checkName,
+      name: target.checkName,
       head_sha: headSha,
       external_id: extId,
       status: "in_progress",
@@ -206,9 +235,13 @@ async function processJob(
     });
     const checkRunId = created.id;
 
-    const bKey = branchKey(repo.fullName, headRepo, headBranch);
-    if (headBranch) {
-      // Stop older active runs on this branch; the poller settles their Check Runs as Stopped.
+    // A newer commit supersedes a branch's earlier runs, but each of the default branch's
+    // commits gets its own run.
+    const bKey = branchKey(repo.fullName, target.name, headRepo, headBranch);
+    const isDefaultBranch =
+      headRepo.toLowerCase() === repo.fullName.toLowerCase() && headBranch === repo.defaultBranch;
+    if (headBranch && !isDefaultBranch) {
+      // The poller settles the stopped runs' Check Runs as cancelled.
       for (const earlier of await store.queryActiveByBranch(bKey)) {
         await stopRun(df, earlier.run_arn);
       }
@@ -219,16 +252,16 @@ async function processJob(
       const artifacts = await gh.paginate(gh.rest.actions.listWorkflowRunArtifacts, {
         ...base,
         run_id: workflowRunId,
-        name: repo.artifactName,
+        name: target.artifactName,
         per_page: 100,
       });
       const chosen = artifacts
-        .filter((a) => a.name === repo.artifactName && !a.expired)
+        .filter((a) => a.name === target.artifactName && !a.expired)
         .sort((a, b) => Date.parse(b.created_at ?? "") - Date.parse(a.created_at ?? ""))[0];
       if (!chosen) {
         throw new PermanentFailure(
           "Artifact expired",
-          `The CI artifact \`${repo.artifactName}\` for this commit is missing or expired. Re-run the CI workflow to rebuild the Android test package.`,
+          `The CI artifact \`${target.artifactName}\` for this commit is missing or expired. Re-run the CI workflow to rebuild it.`,
         );
       }
 
@@ -246,7 +279,7 @@ async function processJob(
       if (resp.status === 410) {
         throw new PermanentFailure(
           "Artifact expired",
-          `The CI artifact \`${repo.artifactName}\` for this commit has expired. Re-run the CI workflow to rebuild the Android test package.`,
+          `The CI artifact \`${target.artifactName}\` for this commit has expired. Re-run the CI workflow to rebuild it.`,
         );
       }
       const loc = resp.headers.get("location");
@@ -262,77 +295,90 @@ async function processJob(
         if (err instanceof DownloadSizeLimitError) {
           throw new PermanentFailure(
             "Artifact too large",
-            `The CI artifact \`${repo.artifactName}\` exceeds the ${Math.round(MAX_ARTIFACT_ZIP_BYTES / (1024 * 1024))} MiB worker limit.`,
+            `The CI artifact \`${target.artifactName}\` exceeds the ${Math.round(MAX_ARTIFACT_ZIP_BYTES / (1024 * 1024))} MiB worker limit.`,
           );
         }
         throw err;
       }
 
-      const pkgPath = join(dir, repo.packageFilename);
-      try {
-        await extractPackageFromZip(
-          outerZip,
-          repo.packageFilename,
-          pkgPath,
-          MAX_ARTIFACT_ZIP_BYTES,
-        );
-      } catch (err) {
-        if (err instanceof InvalidArchiveError || err instanceof PackageNotFoundError) {
-          throw new PermanentFailure(
-            "Invalid artifact",
-            err instanceof InvalidArchiveError
-              ? `The CI artifact \`${repo.artifactName}\` is not a valid ZIP archive or exceeds archive safety limits.`
-              : `The CI artifact \`${repo.artifactName}\` did not contain \`${repo.packageFilename}\`.`,
-          );
+      const extract = async (filename: string) => {
+        const path = join(dir, filename);
+        try {
+          await extractPackageFromZip(outerZip, filename, path, MAX_ARTIFACT_ZIP_BYTES);
+        } catch (err) {
+          if (err instanceof InvalidArchiveError || err instanceof PackageNotFoundError) {
+            throw new PermanentFailure(
+              "Invalid artifact",
+              err instanceof InvalidArchiveError
+                ? `The CI artifact \`${target.artifactName}\` is not a valid ZIP archive or exceeds archive safety limits.`
+                : `The CI artifact \`${target.artifactName}\` did not contain \`${filename}\`.`,
+            );
+          }
+          throw err;
         }
-        throw err;
-      }
+        return path;
+      };
+      const pkgPath = await extract(target.packageFilename);
+      const appPath = target.appFilename ? await extract(target.appFilename) : undefined;
       await rm(outerZip, { force: true });
 
       // Always fetch the test spec from the repo's default branch (main), never from a PR branch.
       const { data: rawSpec } = await gh.rest.repos.getContent({
         ...base,
-        path: repo.testSpecPath,
+        path: target.testSpecPath,
         ref: repo.defaultBranch,
         mediaType: { format: "raw" },
       });
-      const specPath = join(dir, basename(repo.testSpecPath));
+      const specPath = join(dir, basename(target.testSpecPath));
       await writeFile(
         specPath,
         typeof rawSpec === "string" ? rawSpec : Buffer.from(rawSpec as unknown as Uint8Array),
       );
 
-      const testPackageArn = await uploadToDeviceFarm(
-        df,
-        repo.projectArn,
-        repo.packageFilename,
-        "APPIUM_WEB_NODE_TEST_PACKAGE",
-        pkgPath,
-      );
-      const testSpecArn = await uploadToDeviceFarm(
-        df,
-        repo.projectArn,
-        basename(repo.testSpecPath),
-        "APPIUM_WEB_NODE_TEST_SPEC",
-        specPath,
-      );
+      const [testPackageArn, testSpecArn, appArn] = await Promise.all([
+        uploadToDeviceFarm(
+          df,
+          repo.projectArn,
+          target.packageFilename,
+          `${target.testType}_TEST_PACKAGE`,
+          pkgPath,
+        ),
+        uploadToDeviceFarm(
+          df,
+          repo.projectArn,
+          basename(target.testSpecPath),
+          `${target.testType}_TEST_SPEC`,
+          specPath,
+        ),
+        appPath && target.appFilename
+          ? uploadToDeviceFarm(
+              df,
+              repo.projectArn,
+              target.appFilename,
+              appUploadType(target.appFilename),
+              appPath,
+            )
+          : undefined,
+      ]);
 
       const runName =
-        `${repo.name} ${headBranch || "detached"} ${headSha.slice(0, 7)} (run ${workflowRunId})`.slice(
+        `${repo.name} ${target.name} ${headBranch || "detached"} ${headSha.slice(0, 7)} (run ${workflowRunId})`.slice(
           0,
           256,
         );
       const scheduled = await df.send(
         new ScheduleRunCommand({
           projectArn: repo.projectArn,
+          appArn,
           name: runName,
           deviceSelectionConfiguration: {
-            filters: [{ attribute: "ARN", operator: "IN", values: repo.devices }],
-            maxDevices: repo.devices.length,
+            filters: [{ attribute: "ARN", operator: "IN", values: target.devices }],
+            maxDevices: target.devices.length,
           },
-          test: { type: "APPIUM_WEB_NODE", testPackageArn, testSpecArn },
+          test: { type: target.testType, testPackageArn, testSpecArn },
+          configuration: { billingMethod: repo.billingMethod },
           executionConfiguration: {
-            jobTimeoutMinutes: repo.jobTimeoutMinutes,
+            jobTimeoutMinutes: target.jobTimeoutMinutes,
             videoCapture: false,
           },
         }),
@@ -344,6 +390,7 @@ async function processJob(
       try {
         await store.putRun({
           run_arn: runArn,
+          target: target.name,
           state: "ACTIVE",
           created_at: now.toISOString(),
           branch_key: bKey,
@@ -371,13 +418,13 @@ async function processJob(
           details_url: consoleUrl(runArn),
           output: {
             title: "Running on Device Farm",
-            summary: `Scheduled AWS Device Farm run on ${repo.devices.length} devices.`,
+            summary: `Scheduled AWS Device Farm run on ${target.devices.length} devices.`,
           },
         })
         .catch((err) => console.warn("failed to update check details_url", err));
     } catch (err) {
       if (err instanceof PermanentFailure) {
-        await settle("failure", err.title, err.summary, { headSha, extId, checkRunId });
+        await settle(target, "failure", err.title, err.summary, { headSha, extId, checkRunId });
         return;
       }
       throw err;
@@ -386,19 +433,29 @@ async function processJob(
     }
   };
 
-  const handleConclusion = async (conclusion: string, runId: number, attempt: number) => {
+  const handleConclusion = async (
+    target: TargetConfig,
+    conclusion: string,
+    runId: number,
+    attempt: number,
+  ) => {
     const extId = formatExternalId(runId, attempt);
     if (conclusion === "success") {
-      await scheduleRun(runId, attempt, false);
+      await scheduleRun(target, runId, attempt, false);
     } else if (conclusion === "skipped") {
-      await settle("success", "Not needed", "No Android device tests needed for this change.", {
-        extId,
-      });
+      await settle(
+        target,
+        "success",
+        "Not needed",
+        `CI skipped \`${target.triggerJob}\`, so this change needs no device tests.`,
+        { extId },
+      );
     } else {
       await settle(
+        target,
         "failure",
         "Build failed",
-        `\`${repo.triggerJob}\` finished with conclusion \`${conclusion || "unknown"}\`.`,
+        `\`${target.triggerJob}\` finished with conclusion \`${conclusion || "unknown"}\`.`,
         { extId },
       );
     }
@@ -406,7 +463,10 @@ async function processJob(
 
   if (msg.event === "workflow_job" && msg.action === "completed") {
     if (msg.headBranch && !branchAllowed(cfg, msg.headBranch)) return;
+    const target = findTargetByName(repo, msg.target);
+    if (!target) return;
     await handleConclusion(
+      target,
       msg.jobConclusion ?? "",
       msg.workflowRunId ?? 0,
       Math.max(1, msg.workflowRunAttempt ?? 1),
@@ -417,31 +477,36 @@ async function processJob(
     const attempt = Math.max(1, msg.workflowRunAttempt ?? 1);
     const extId = formatExternalId(runId, attempt);
 
-    const existing = await gh.paginate(gh.rest.checks.listForRef, {
-      ...base,
-      ref: msg.headSha,
-      check_name: repo.checkName,
-      filter: "all",
-      per_page: 100,
-    });
-    if (existing.some((c) => c.external_id === extId)) return;
-
     const jobs = await gh.paginate(
       "GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}/jobs",
       { ...base, run_id: runId, attempt_number: attempt, per_page: 100 },
     );
-    const trigger = jobs.find((j) => j.name === repo.triggerJob);
-    if (!trigger) {
-      await settle(
-        "success",
-        "Not needed",
-        `Workflow \`${repo.workflowName}\` completed without running \`${repo.triggerJob}\`.`,
-        { extId },
-      );
-    } else {
-      await handleConclusion(trigger.conclusion ?? "", runId, attempt);
+    for (const target of repo.targets) {
+      const existing = await gh.paginate(gh.rest.checks.listForRef, {
+        ...base,
+        ref: msg.headSha,
+        check_name: target.checkName,
+        filter: "all",
+        per_page: 100,
+      });
+      if (existing.some((c) => c.external_id === extId)) continue;
+
+      const trigger = jobs.find((j) => j.name === target.triggerJob);
+      if (!trigger) {
+        await settle(
+          target,
+          "success",
+          "Not needed",
+          `Workflow \`${repo.workflowName}\` completed without running \`${target.triggerJob}\`.`,
+          { extId },
+        );
+      } else {
+        await handleConclusion(target, trigger.conclusion ?? "", runId, attempt);
+      }
     }
   } else if (msg.event === "check_run" && msg.action === "rerequested") {
+    const target = findTargetByName(repo, msg.target);
+    if (!target) return;
     let parsed = parseExternalId(msg.externalId);
     if (!parsed && msg.checkRunId) {
       const match = (await store.queryByRepoSha(repo.fullName, msg.headSha)).find(
@@ -453,12 +518,13 @@ async function processJob(
     }
     if (!parsed) {
       await settle(
+        target,
         "failure",
         "Unable to re-run",
         "Could not identify the GitHub Actions workflow run for this commit. Re-run the CI workflow instead.",
       );
       return;
     }
-    await scheduleRun(parsed.runId, parsed.attempt, true);
+    await scheduleRun(target, parsed.runId, parsed.attempt, true);
   }
 }

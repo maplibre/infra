@@ -58,41 +58,74 @@ describe("config & helpers", () => {
     assert.equal(cfg.repoProjects.get("maplibre/mln-rs"), projectArn);
     assert.throws(() => loadConfig({ MODE: "worker" }));
 
+    const meta = { fullName: "maplibre/mln-rs", defaultBranch: "main", projectArn };
+    const android = `
+      trigger_job = "prepare-android-device-tests"
+      artifact_name = "android-device-tests"
+      check_name = "device-test / android"
+      test_type = "APPIUM_WEB_NODE"
+      package_filename = "tests.zip"
+      test_spec_path = "tools/device-farm/android/test-spec.yml"
+      devices = ["arn:aws:devicefarm:us-west-2::device:1"]
+    `;
+    const ios = `
+      trigger_job = "prepare-ios-device-tests"
+      artifact_name = "ios-device-tests"
+      check_name = "device-test / ios"
+      test_type = "APPIUM_NODE"
+      package_filename = "tests.zip"
+      app_filename = "app.ipa"
+      test_spec_path = "tools/device-farm/ios/test-spec.yml"
+      job_timeout_minutes = 45
+      devices = ["arn:aws:devicefarm:us-west-2::device:2"]
+    `;
     const repo = parseRepoConfig(
-      `
-      workflow_name = "ci"
+      `workflow_name = "ci"\npull_requests = false\nbilling_method = "UNMETERED"\n[targets.android]\n${android}\n[targets.ios]\n${ios}`,
+      meta,
+    );
+    assert.equal(repo.pullRequests, false);
+    assert.equal(repo.billingMethod, "UNMETERED");
+    assert.deepEqual(
+      repo.targets.map((t) => [t.name, t.testType, t.appFilename, t.jobTimeoutMinutes]),
+      [
+        ["android", "APPIUM_WEB_NODE", undefined, 60],
+        ["ios", "APPIUM_NODE", "app.ipa", 45],
+      ],
+    );
+
+    const defaults = parseRepoConfig(`workflow_name = "ci"\n[targets.android]\n${android}`, meta);
+    assert.equal(defaults.pullRequests, true);
+    assert.equal(defaults.billingMethod, "METERED");
+
+    // The single-target file that predates targets.
+    const legacy = parseRepoConfig(
+      `workflow_name = "ci"
       trigger_job = "prepare-device-tests"
       artifact_name = "android-device-tests"
       package_filename = "android-tests.zip"
       test_spec_path = "tools/device-farm/android.yml"
       check_name = "device-test / android"
-      job_timeout_minutes = 45
-      devices = [
-        "arn:aws:devicefarm:us-west-2::device:6D89F408709B4D3BBBBB17696A24B141",
-      ]
-      `,
-      { fullName: "maplibre/mln-rs", defaultBranch: "main", projectArn },
+      devices = ["arn:aws:devicefarm:us-west-2::device:1"]`,
+      meta,
     );
-    assert.equal(repo.triggerJob, "prepare-device-tests");
-    assert.equal(repo.jobTimeoutMinutes, 45);
-    assert.equal(repo.devices.length, 1);
+    assert.deepEqual(
+      legacy.targets.map((t) => [t.name, t.triggerJob, t.testType]),
+      [["default", "prepare-device-tests", "APPIUM_WEB_NODE"]],
+    );
 
-    assert.throws(
-      () =>
-        parseRepoConfig(
-          `workflow_name = "ci"\ntrigger_job = "a"\nartifact_name = "b"\npackage_filename = "../evil.zip"\ntest_spec_path = "c"\ncheck_name = "d"\ndevices = ["arn:aws:devicefarm:us-west-2::device:1"]`,
-          { fullName: "maplibre/mln-rs", defaultBranch: "main", projectArn },
-        ),
-      InvalidRepoConfigError,
-    );
-    assert.throws(
-      () =>
-        parseRepoConfig(
-          `workflow_name = "ci"\ntrigger_job = "a"\nartifact_name = "b"\npackage_filename = "p.zip"\ntest_spec_path = "c"\ncheck_name = "d"\njob_timeout_minutes = 999\ndevices = ["arn:aws:devicefarm:us-west-2::device:1"]`,
-          { fullName: "maplibre/mln-rs", defaultBranch: "main", projectArn },
-        ),
-      InvalidRepoConfigError,
-    );
+    for (const bad of [
+      `workflow_name = "ci"`,
+      `workflow_name = "ci"\n[targets.android]\n${android.replace("tests.zip", "../evil.zip")}`,
+      `workflow_name = "ci"\n[targets.android]\n${android}\njob_timeout_minutes = 999`,
+      `workflow_name = "ci"\n[targets.android]\n${android.replace("APPIUM_WEB_NODE", "XCTEST")}`,
+      `workflow_name = "ci"\n[targets.ios]\n${ios.replace('app_filename = "app.ipa"', "")}`,
+      `workflow_name = "ci"\n[targets.android]\n${android}\napp_filename = "app.apk"`,
+      `workflow_name = "ci"\nbilling_method = "FREE"\n[targets.android]\n${android}`,
+      `workflow_name = "ci"\n[targets.a]\n${android}\n[targets.b]\n${android}`,
+      `workflow_name = "ci"\n[targets.Android]\n${android}`,
+    ]) {
+      assert.throws(() => parseRepoConfig(bad, meta), InvalidRepoConfigError, bad);
+    }
 
     assert.deepEqual(parseExternalId("123"), { runId: 123, attempt: 1 });
     assert.deepEqual(parseExternalId("123:2"), { runId: 123, attempt: 2 });

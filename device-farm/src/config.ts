@@ -17,6 +17,26 @@ export class InvalidRepoConfigError extends Error {
   }
 }
 
+export type TestType = "APPIUM_WEB_NODE" | "APPIUM_NODE";
+export type BillingMethod = "METERED" | "UNMETERED";
+export const TEST_TYPES: readonly TestType[] = ["APPIUM_WEB_NODE", "APPIUM_NODE"];
+export const BILLING_METHODS: readonly BillingMethod[] = ["METERED", "UNMETERED"];
+
+/** One kind of Device Farm run: a CI job's package, its test spec, and its devices. */
+export interface TargetConfig {
+  name: string;
+  triggerJob: string;
+  artifactName: string;
+  testType: TestType;
+  packageFilename: string;
+  /** An app that the run installs, for test types that test an app. */
+  appFilename?: string;
+  testSpecPath: string;
+  checkName: string;
+  jobTimeoutMinutes: number;
+  devices: string[];
+}
+
 export interface RepoConfig {
   fullName: string;
   owner: string;
@@ -24,14 +44,18 @@ export interface RepoConfig {
   defaultBranch: string;
   projectArn: string;
   workflowName: string;
-  triggerJob: string;
-  artifactName: string;
-  packageFilename: string;
-  testSpecPath: string;
-  checkName: string;
-  jobTimeoutMinutes: number;
-  devices: string[];
+  /** Whether pull requests' CI runs run on the devices; when not, their checks pass as not needed. */
+  pullRequests: boolean;
+  billingMethod: BillingMethod;
+  targets: TargetConfig[];
 }
+
+export const findTargetByJob = (repo: RepoConfig, job?: string) =>
+  repo.targets.find((t) => t.triggerJob === job);
+export const findTargetByCheck = (repo: RepoConfig, check?: string) =>
+  repo.targets.find((t) => t.checkName === check);
+export const findTargetByName = (repo: RepoConfig, name?: string) =>
+  repo.targets.find((t) => t.name === name);
 
 export interface Config {
   mode: Mode;
@@ -49,6 +73,8 @@ export interface JobMessage {
   event: "workflow_job" | "workflow_run" | "check_run";
   action: string;
   repo: string;
+  /** The target that a workflow_job or check_run event is for; a workflow_run is for every target. */
+  target?: string;
   defaultBranch: string;
   installationId: number;
   headSha: string;
@@ -63,6 +89,7 @@ export interface JobMessage {
 
 export interface RunRecord {
   run_arn: string;
+  target?: string;
   state: "ACTIVE" | "COMPLETED";
   created_at: string;
   branch_key: string;
@@ -139,8 +166,8 @@ export const lookupProjectArn = (cfg: Config, fullName: string) =>
   cfg.repoProjects.get(fullName.trim().toLowerCase());
 export const branchAllowed = (cfg: Config, branch?: string) =>
   cfg.allowedBranches.size === 0 || (Boolean(branch) && cfg.allowedBranches.has(branch!));
-export const branchKey = (repo: string, headRepo: string, headBranch: string) =>
-  `${repo.toLowerCase()}#${(headRepo || repo).toLowerCase()}#${headBranch}`;
+export const branchKey = (repo: string, target: string, headRepo: string, headBranch: string) =>
+  `${repo.toLowerCase()}#${target}#${(headRepo || repo).toLowerCase()}#${headBranch}`;
 export const repoShaKey = (repo: string, sha: string) => `${repo.toLowerCase()}#${sha}`;
 export const formatExternalId = (runId: number, attempt: number) =>
   `${runId}:${Math.max(1, attempt)}`;
@@ -161,6 +188,96 @@ export function parseExternalId(raw?: string): { runId: number; attempt: number 
     : null;
 }
 
+const TARGET_NAME = /^[a-z0-9][a-z0-9_-]*$/;
+
+function plainFilename(value: string, where: string) {
+  if (value.includes("/") || value.includes("\\") || value === "." || value === "..") {
+    throw new InvalidRepoConfigError(`${where} must be a plain filename without path separators`);
+  }
+  return value;
+}
+
+function parseTarget(name: string, raw: unknown): TargetConfig {
+  const where = `${REPO_CONFIG_PATH}: targets.${name}`;
+  if (!TARGET_NAME.test(name)) {
+    throw new InvalidRepoConfigError(
+      `${REPO_CONFIG_PATH}: target name "${name}" must be lowercase letters, digits, "-" or "_"`,
+    );
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new InvalidRepoConfigError(`${where} must be a table`);
+  }
+  const doc = raw as Record<string, unknown>;
+  const reqStr = (key: string) => {
+    const v = doc[key];
+    if (typeof v !== "string" || !v.trim()) {
+      throw new InvalidRepoConfigError(`${where}: "${key}" must be a non-empty string`);
+    }
+    return v.trim();
+  };
+
+  const timeout =
+    doc.job_timeout_minutes === undefined ? DEFAULT_JOB_TIMEOUT_MINUTES : doc.job_timeout_minutes;
+  if (
+    typeof timeout !== "number" ||
+    !Number.isInteger(timeout) ||
+    timeout < 1 ||
+    timeout > MAX_JOB_TIMEOUT_MINUTES
+  ) {
+    throw new InvalidRepoConfigError(
+      `${where}: "job_timeout_minutes" must be an integer between 1 and ${MAX_JOB_TIMEOUT_MINUTES}`,
+    );
+  }
+
+  const rawDevices = doc.devices;
+  if (!Array.isArray(rawDevices) || rawDevices.length === 0 || rawDevices.length > MAX_DEVICES) {
+    throw new InvalidRepoConfigError(
+      `${where}: "devices" must be an array of 1 to ${MAX_DEVICES} Device Farm ARNs`,
+    );
+  }
+  const devices = rawDevices.map((d) => {
+    if (typeof d !== "string" || !d.trim().startsWith("arn:aws:devicefarm:")) {
+      throw new InvalidRepoConfigError(
+        `${where}: every entry in "devices" must be an arn:aws:devicefarm: ARN`,
+      );
+    }
+    return d.trim();
+  });
+
+  const testType = reqStr("test_type") as TestType;
+  if (!TEST_TYPES.includes(testType)) {
+    throw new InvalidRepoConfigError(
+      `${where}: "test_type" must be one of ${TEST_TYPES.join(", ")}`,
+    );
+  }
+
+  let appFilename: string | undefined;
+  if (doc.app_filename !== undefined) {
+    appFilename = plainFilename(reqStr("app_filename"), `${where}: "app_filename"`);
+    if (!/\.(apk|ipa)$/.test(appFilename)) {
+      throw new InvalidRepoConfigError(`${where}: "app_filename" must name an .apk or .ipa file`);
+    }
+  }
+  if ((testType === "APPIUM_NODE") !== Boolean(appFilename)) {
+    throw new InvalidRepoConfigError(
+      `${where}: "app_filename" is required for APPIUM_NODE and not allowed for APPIUM_WEB_NODE`,
+    );
+  }
+
+  return {
+    name,
+    triggerJob: reqStr("trigger_job"),
+    artifactName: reqStr("artifact_name"),
+    testType,
+    packageFilename: plainFilename(reqStr("package_filename"), `${where}: "package_filename"`),
+    appFilename,
+    testSpecPath: reqStr("test_spec_path"),
+    checkName: reqStr("check_name"),
+    jobTimeoutMinutes: timeout,
+    devices,
+  };
+}
+
 export function parseRepoConfig(
   rawToml: string,
   meta: { fullName: string; defaultBranch: string; projectArn: string },
@@ -177,52 +294,47 @@ export function parseRepoConfig(
     );
   }
 
-  const reqStr = (key: string) => {
-    const v = doc[key];
-    if (typeof v !== "string" || !v.trim()) {
-      throw new InvalidRepoConfigError(`${REPO_CONFIG_PATH}: "${key}" must be a non-empty string`);
-    }
-    return v.trim();
-  };
-
-  const timeout =
-    doc.job_timeout_minutes === undefined ? DEFAULT_JOB_TIMEOUT_MINUTES : doc.job_timeout_minutes;
-  if (
-    typeof timeout !== "number" ||
-    !Number.isInteger(timeout) ||
-    timeout < 1 ||
-    timeout > MAX_JOB_TIMEOUT_MINUTES
-  ) {
+  const workflowName = doc.workflow_name;
+  if (typeof workflowName !== "string" || !workflowName.trim()) {
     throw new InvalidRepoConfigError(
-      `${REPO_CONFIG_PATH}: "job_timeout_minutes" must be an integer between 1 and ${MAX_JOB_TIMEOUT_MINUTES}`,
+      `${REPO_CONFIG_PATH}: "workflow_name" must be a non-empty string`,
     );
   }
 
-  const rawDevices = doc.devices;
-  if (!Array.isArray(rawDevices) || rawDevices.length === 0 || rawDevices.length > MAX_DEVICES) {
+  const pullRequests = doc.pull_requests ?? true;
+  if (typeof pullRequests !== "boolean") {
+    throw new InvalidRepoConfigError(`${REPO_CONFIG_PATH}: "pull_requests" must be a boolean`);
+  }
+
+  const billingMethod = (doc.billing_method ?? "METERED") as BillingMethod;
+  if (!BILLING_METHODS.includes(billingMethod)) {
     throw new InvalidRepoConfigError(
-      `${REPO_CONFIG_PATH}: "devices" must be an array of 1 to ${MAX_DEVICES} Device Farm ARNs`,
+      `${REPO_CONFIG_PATH}: "billing_method" must be one of ${BILLING_METHODS.join(", ")}`,
     );
   }
-  const devices = rawDevices.map((d) => {
-    if (typeof d !== "string" || !d.trim().startsWith("arn:aws:devicefarm:")) {
+
+  // Until mln-rs's main moves to targets: its earlier single-target file, as one target.
+  const rawTargets =
+    doc.targets === undefined && doc.trigger_job !== undefined
+      ? { default: { ...doc, test_type: "APPIUM_WEB_NODE" } }
+      : doc.targets;
+  if (!rawTargets || typeof rawTargets !== "object" || Array.isArray(rawTargets)) {
+    throw new InvalidRepoConfigError(
+      `${REPO_CONFIG_PATH}: "targets" must be a table of at least one target`,
+    );
+  }
+  const targets = Object.entries(rawTargets).map(([name, raw]) => parseTarget(name, raw));
+  if (targets.length === 0) {
+    throw new InvalidRepoConfigError(
+      `${REPO_CONFIG_PATH}: "targets" must have at least one target`,
+    );
+  }
+  for (const key of ["triggerJob", "checkName"] as const) {
+    if (new Set(targets.map((t) => t[key])).size !== targets.length) {
       throw new InvalidRepoConfigError(
-        `${REPO_CONFIG_PATH}: every entry in "devices" must be an arn:aws:devicefarm: ARN`,
+        `${REPO_CONFIG_PATH}: every target needs its own ${key === "triggerJob" ? "trigger_job" : "check_name"}`,
       );
     }
-    return d.trim();
-  });
-
-  const packageFilename = reqStr("package_filename");
-  if (
-    packageFilename.includes("/") ||
-    packageFilename.includes("\\") ||
-    packageFilename === "." ||
-    packageFilename === ".."
-  ) {
-    throw new InvalidRepoConfigError(
-      `${REPO_CONFIG_PATH}: "package_filename" must be a plain filename without path separators`,
-    );
   }
 
   return {
@@ -231,14 +343,10 @@ export function parseRepoConfig(
     name: parts.name,
     defaultBranch: meta.defaultBranch || "main",
     projectArn: meta.projectArn,
-    workflowName: reqStr("workflow_name"),
-    triggerJob: reqStr("trigger_job"),
-    artifactName: reqStr("artifact_name"),
-    packageFilename,
-    testSpecPath: reqStr("test_spec_path"),
-    checkName: reqStr("check_name"),
-    jobTimeoutMinutes: timeout,
-    devices,
+    workflowName: workflowName.trim(),
+    pullRequests,
+    billingMethod,
+    targets,
   };
 }
 
